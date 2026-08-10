@@ -1,0 +1,12 @@
+{
+  "width": 1024,
+  "height": 576,
+  "fx": 340.0,
+  "fy": 340.0,
+  "cx": 512.0,
+  "cy": 288.0,
+  "height_m": 0.148,
+  "pitch_rad": 0.05235987755982989,
+  "source": "spin360_loop_closure",
+  "notes": "fx/FOV measured on the live Mini+ by closing a 360 deg in-place spin (48 frames, 226-inlier loop closure); fx=330-350px -> ~113 deg, vs the 90 deg previously assumed everywhere (1.5x error). pitch from RANSAC ground plane at this fx. height_m 0.148 from the official MINI+ dimension drawing (195 mm body, 148 mm to camera centre; 250x190 mm footprint, 160 mm wheelbase). Lens shows visible barrel distortion, so pinhole degrades near the frame edges."
+}
