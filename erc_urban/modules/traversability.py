@@ -1,44 +1,21 @@
 """
-Module 6 — the traversability veto (semantic half).
+The traversability veto (semantic half): a HARD veto applied AFTER selection.
+If the chosen candidate crosses untraversable surface, drop it and take the
+next-best that does not.
 
-plan.md: a HARD veto applied AFTER selection. If the chosen candidate crosses
-untraversable surface, drop it and take the next-best that doesn't. GeNIE won
-ERC ICRA'25 with exactly this (79% of max, zero interventions), and Sorokin's
-sidewalk study is why: curb cuts, driveways and grass-vs-pavement confusion are
-the dominant sidewalk-violation failure mode — all of them *semantic*
-distinctions that geometry cannot make. A grass verge and the path beside it
-are the same flat plane.
-
-WHAT THIS REPLACES
-------------------
-`upgrades.TraversabilityGate.mask` returns `np.ones(len(cands), bool)` when its
-predictor is None, and its predictor is always None. It is a no-op that has
-never vetoed anything at any stage. Worse, run.py:898 only reaches the gate at
-all when `path is not None`, i.e. only under USE_DIRT_GATE=1 — so the SAM2 veto
-was doubly unreachable.
-
-HOW IT WORKS
-------------
 Project each candidate's waypoints to image space through `calib`, sample the
-traversability mask at those pixels, veto the candidate if too much of its path
-lands on untraversable surface. Image-space sampling rather than GeNIE's BEV
-rasterisation because we already HAVE the candidates — we do not need to plan in
-BEV, only to test paths — and it avoids the resolution loss of a second
-rasterisation step.
+mask at those pixels, veto if too much of the path lands on bad surface. Image
+space rather than BEV because we already HAVE the candidates — we only need to
+test paths, not plan in BEV.
 
-The mask source is pluggable on purpose. `SegFormerSource` works today off the
-SegFormer-B2 model `semantics.py` already loads. `SAMTPSource` is the GeNIE
-model proper and needs weights that only come from a manual Google Drive
-download, so it stays behind an explicit constructor argument rather than a
-silent import that fails to None and vetoes nothing — which is the exact bug
-this module exists to fix.
+The mask source is pluggable: SegFormerSource works today off the model
+semantics.py already loads; SAMTPSource needs a manual weights download, so it
+stays behind an explicit constructor argument rather than silently failing to
+None and vetoing nothing.
 
-RELATION TO THE GEOMETRIC VETO
-------------------------------
-`DepthCostmap.veto` stays: geometry catches solid things regardless of what the
-segmenter calls them. This adds the surface judgement geometry cannot make.
-Semantics may only ADD hazards, never clear a geometric one — the invariant
-already stated at costmap.py:223. Both are vetoes; a candidate must pass both.
+Complementary to DepthCostmap.veto, which catches solid things whatever the
+segmenter calls them. A candidate must pass both, and semantics may only ADD
+hazards, never clear a geometric one.
 """
 from __future__ import annotations
 
@@ -62,14 +39,11 @@ class TraversabilitySource(Protocol):
 
 class SegFormerSource:
     """
-    Adapter over the SegFormer-B2 ADE20K model `semantics.py` already loads.
+    Adapter over the SegFormer-B2 ADE20K model semantics.py already loads.
 
-    Available with no extra download, which makes it the default: a working
-    veto today beats a better veto that needs weights nobody has fetched.
-    Reuses `SemanticTraversability.categorize`, so it inherits that module's
-    traversable-by-exclusion policy (semantics.py:174) — vegetation and hazards
-    are the small well-defined sets, everything else at ground level is
-    drivable — rather than duplicating a second, divergent class list.
+    The default because it needs no extra download. Reuses
+    `SemanticTraversability.categorize` so it inherits the same
+    traversable-by-exclusion policy rather than duplicating a divergent list.
     """
 
     def __init__(self, semantics=None, device: str = "auto", size: int = 512):
@@ -90,26 +64,23 @@ class SegFormerSource:
         if labels is None:
             return None
         hard, soft, good = self.sem.categorize(labels)
-        # `soft` (grass, plants) is drivable-but-off-track. It is costed by
-        # costmap.offtrack_cost, NOT vetoed here: a rover that refuses to touch
-        # a verge cannot get around a parked car.
-        return np.asarray(good & ~hard, dtype=bool)
+        # `soft` (grass, plants) is drivable-but-off-track: costed by
+        # costmap.offtrack_cost, NOT vetoed here. A rover that refuses to touch
+        # a verge cannot get around a parked car — and on a grass site,
+        # excluding soft reported all_untraversable 12/12 on ground with zero
+        # hazard and a fully drivable near field.
+        return np.asarray((good | soft) & ~hard, dtype=bool)
 
 
 class SAMTPSource:
     """
-    GeNIE's SAM-TP (jiaming-ai/GENIE-SAMTP): SAM2 fine-tuned on 15,347
-    annotated road scenes for pixel-wise traversability.
-
-    Better than ADE20K semantics for this job — it was trained for exactly this
-    label, on outdoor road scenes, rather than repurposed from a general scene
-    parser. Not the default only because the checkpoint is a manual Google Drive
+    SAM-TP: SAM2 fine-tuned on annotated road scenes for pixel-wise
+    traversability. Trained for exactly this label rather than repurposed from a
+    general scene parser, but not the default because the checkpoint is a manual
     download.
 
-    >>> WIRE: point `predictor` at a loaded SAM-TP model exposing
-    `predict(rgb, K, pose) -> (H, W) logits`. Its documented inputs are an
-    (H,W,3) uint8 array, a 3x3 intrinsics matrix and a 4x4 camera pose — which
-    is why `calib.py` exists and produces both.
+    UNWIRED: point `predictor` at a loaded model exposing
+    `predict(rgb, K, pose) -> (H, W) logits`.
     """
 
     def __init__(self, predictor=None, calib: Optional[CameraCalibration] = None,
@@ -140,11 +111,7 @@ class SAMTPSource:
 
 
 class TraversabilityVeto:
-    """
-    M6 semantic veto. Honors the `SafetyGate` protocol.
-
-    Returns a boolean mask over candidates, True = safe to keep.
-    """
+    """Semantic veto. `mask` returns True per candidate that is safe to keep."""
 
     def __init__(
         self,
@@ -157,25 +124,19 @@ class TraversabilityVeto:
         min_traversable_frac: float = 0.02,
     ):
         """
-        max_bad_frac: veto once this fraction of a path's sampled points land on
-            untraversable surface. Not zero-tolerance: monocular segmentation is
-            noisy at boundaries, and a single stray pixel on a curb edge must
-            not kill an otherwise good path — that fails closed and strands the
-            rover, the failure mode `semantics.py` already warns about.
-        min_samples: below this many in-frame points we have no real evidence,
-            so the candidate passes. Absence of evidence is not a veto; the
-            geometric costmap is still watching.
-        samples_per_segment: waypoints are metres apart, so consecutive points
-            can straddle an entire curb. Interpolate along each segment.
-        min_traversable_frac: below this the segmenter is not discriminating
-            and its output is ignored. Measured need: SegFormer labels
-            `synth_dirt_path` 100% "sky" and `mauritius_rover_block` 84% "wall"
-            — an out-of-distribution frame does not produce a cautious mask, it
-            produces a confident nonsense one, and this veto would then kill
-            every candidate and hand run.py a spurious "no way forward". A
-            genuinely impassable scene is not this module's call: run.py's
-            TRACK_MIN check already owns "no path visible", and the geometric
-            costmap is watching independently.
+        max_bad_frac: veto once this fraction of sampled points land on bad
+            surface. Not zero-tolerance — monocular segmentation is noisy at
+            boundaries and one stray pixel on a curb edge must not kill a good
+            path, which fails closed and strands the rover.
+        min_samples: below this many in-frame points there is no evidence, so
+            the candidate passes. The geometric costmap is still watching.
+        samples_per_segment: waypoints are metres apart and can straddle a whole
+            curb, so interpolate along each segment.
+        min_traversable_frac: below this the segmenter is not discriminating and
+            its output is ignored. An out-of-distribution frame produces a
+            confident nonsense mask, not a cautious one (SegFormer labels one
+            fixture 100% "sky", another 84% "wall"), and vetoing everything on
+            that hands run.py a spurious "no way forward".
         """
         self.source = source if source is not None else SegFormerSource()
         self.calib = calib
@@ -253,12 +214,11 @@ class TraversabilityVeto:
         self, obs: Observation, cands: list[Candidate], chosen: int
     ) -> tuple[int, str]:
         """
-        plan.md's actual M6 contract: a veto applied AFTER selection.
+        The veto proper: applied AFTER selection, returns (index, note).
 
-        Returns (index, note). If the selected candidate is untraversable, fall
-        back to the next-best traversable one by score. If nothing is
-        traversable we return the original choice and say so — the caller
-        (run.py) already has reverse/scan recovery for "no way forward", and
+        If the chosen candidate is untraversable, fall back to the next-best
+        traversable one by score. If nothing is traversable, return the original
+        choice and say so — run.py owns the "no way forward" recovery, and
         silently substituting an unsafe path would be worse than reporting it.
         """
         if not cands:

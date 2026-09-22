@@ -1,15 +1,9 @@
 """
-GPS -> robot-frame goal geometry (Module 2, geometric part).
+GPS -> robot-frame goal geometry.
 
-Given the rover's (lat, lon, yaw) and a checkpoint (lat, lon), compute the
-goal's bearing and range in the ROBOT frame. This is the "soft directional
-prior" that UrbanVLA-style route-visual alignment later refines — the
-baseline uses it directly; the upgrade fuses it with vision instead of
-trusting it.
-
-NOTE the 15 m tolerance: a checkpoint counts as reached within ~15 m, and
-consumer GPS in urban canyons is noisy, so treat range as approximate and
-NEVER hard-servo to a raw fix.
+Bearing and range to a checkpoint, in the robot frame. A checkpoint counts as
+reached within ~15 m and consumer GPS in urban canyons is noisy, so this is a
+directional prior: never hard-servo to a raw fix.
 """
 from __future__ import annotations
 import math
@@ -29,10 +23,8 @@ def geodesic_bearing_range(lat0, lon0, yaw, lat1, lon1):
     dlat = p1 - p0
     a = math.sin(dlat / 2) ** 2 + math.cos(p0) * math.cos(p1) * math.sin(dlon / 2) ** 2
     rng = 2 * _R_EARTH * math.asin(min(1.0, math.sqrt(a)))
-    # into robot frame, LEFT-POSITIVE (CCW from forward), matching
-    # waypoints (x_forward, y_left) and atan2(y, x) in the baseline planner.
-    # bearing_north and yaw are both CW-from-North; relative CW is
-    # (bearing_north - yaw); negate for left-positive.
+    # Robot frame is LEFT-POSITIVE to match (x_forward, y_left) waypoints.
+    # bearing_north and yaw are both CW-from-North, so negate the difference.
     if yaw is None:
         return _wrap(-bearing_north), rng
     return _wrap(-(bearing_north - yaw)), rng

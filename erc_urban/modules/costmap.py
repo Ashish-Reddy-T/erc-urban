@@ -1,30 +1,21 @@
 """
-Ground-relative obstacle costmap (Module 6, geometric half).
+Ground-relative obstacle costmap (the geometric veto).
 
-Replaces the "analyse a fixed middle band of the image" heuristic in
-ERC-3's OutdoorTraversability, which discards rows 60-100% as "ground
-directly underfoot" and is therefore structurally blind to anything low and
-close: rocks, curbs, ruts, dogs, a person's legs. On Mexican dirt that is most
-of what can actually stop the rover.
-
-Instead of guessing which pixels are ground, compute it:
+Rather than guessing which pixels are ground — a fixed image band is
+structurally blind to anything low and close, which is most of what can stop
+this rover — compute it:
 
     depth -> 3D points (camera frame)
     -> RANSAC ground plane
-    -> height above that plane, per point
+    -> per-point height above that plane
     -> anything standing above it is an obstacle, whatever image row it is in
     -> rasterise into a robot-frame occupancy grid
-    -> veto any candidate trajectory that drives through occupied cells
+    -> veto any candidate that drives through occupied cells
 
-The veto architecture is GeNIE's Module 6 as described in plan.md: a hard
-safety layer applied AFTER candidate selection, which also doubles as the
-reactive collision gate. What differs is the costmap source — geometry here,
-rather than SAM2 masks. Geometry needs no weights, no download, and answers
-"is there a thing in my way" directly; semantics (dirt vs grass vs person)
-are a separate layer that can veto on top of this one.
+Geometry needs no weights and answers "is there a thing in my way" directly.
+Semantics (dirt vs grass vs person) is a separate layer vetoing on top.
 
-Camera frame convention: X right, Y down, Z forward (optical axis).
-Robot frame convention: x forward, y left — matching Candidate.waypoints.
+Camera frame: X right, Y down, Z forward. Robot frame: x forward, y left.
 """
 from __future__ import annotations
 
@@ -37,15 +28,11 @@ import numpy as np
 
 @dataclass
 class CostmapConfig:
-    # MEASURED on the live Mini+, not assumed. The old 90.0 here (and the same
-    # figure in ERC-3 depth_estimator.py:241) was a guess, and it is wrong by
-    # 1.5x: closing a 360 deg in-place spin gives fx = 330-350 px on a 1024-wide
-    # frame, i.e. ~113 deg, not 512 px / 90 deg. See erc_urban/camera_front.json
-    # and calib.py. Backprojected lateral extent scales as 1/fx, so the old
-    # value compressed the world sideways by 1.5x.
-    #
-    # The lens has visible barrel distortion at this width, so the pinhole model
-    # degrades toward the edges; the near-field centre used for the veto is fine.
+    # MEASURED, not assumed: closing a 360 deg in-place spin gives fx 330-350 px
+    # on a 1024-wide frame, i.e. ~113 deg, not the 90 deg previously assumed.
+    # Lateral extent scales as 1/fx, so 90 deg compressed the world by 1.5x.
+    # Barrel distortion degrades the pinhole model near the edges; the
+    # near-field centre used for the veto is fine.
     fov_horizontal_deg: float = 112.8
     # A point this far above the fitted ground plane is an obstacle.
     obstacle_height_m: float = 0.18
@@ -58,6 +45,9 @@ class CostmapConfig:
     cell_m: float = 0.15
     grid_forward_m: float = 8.0
     grid_half_width_m: float = 4.0
+    # Only the near field of a long candidate can hit this grid honestly.
+    # 10 m arcs otherwise die on smeared memory past the bumper.
+    veto_range_m: float = 2.5
     # Rover half-width plus margin; obstacles inflate by this for the veto.
     rover_radius_m: float = 0.35
     # RANSAC.
@@ -66,7 +56,15 @@ class CostmapConfig:
     # Ground plane normal must be within this of "up" or the fit is rejected.
     min_up_dot: float = 0.75
     # Persist obstacles briefly so a rock does not vanish when it leaves view.
+    # The history is robot-frame and is NOT transported between ticks, so it is
+    # only valid while the rover is roughly still: yaw more than
+    # `memory_max_yaw_deg` and OR-ing the stored grids smears every past
+    # obstacle across the fan at the wrong bearing. Measured — an in-place pivot
+    # on empty ground vetoed 12/12 candidates with pts=0 in the same log line.
+    # Forgetting a real rock is recoverable; a rock remembered in the wrong
+    # direction is not, because it steers while looking like evidence.
     memory_frames: int = 3
+    memory_max_yaw_deg: float = 4.0
 
 
 @dataclass
@@ -170,19 +168,34 @@ class DepthCostmap:
         return best_n, best_d
 
     # ---- main -------------------------------------------------------------
+    def forget_memory(self) -> None:
+        """Drop the robot-frame occupancy history (see `memory_max_yaw_deg`)."""
+        self._history.clear()
+
     def compute(
         self,
         depth: np.ndarray,
         hard_mask: Optional[np.ndarray] = None,
         soft_mask: Optional[np.ndarray] = None,
+        odom=None,
     ) -> CostmapResult:
         """
         hard_mask / soft_mask: (H,W) bool, aligned with `depth`.
           hard — occupied regardless of height (people, cars, water: a puddle
                  is a perfectly flat ground plane and geometry cannot see it).
           soft — drivable but off-track (grass); costed, never vetoed.
+        odom — this tick's `OdomDelta`, used only to decide whether the stored
+          history is still valid in the current robot frame. Optional.
         """
         cfg = self.cfg
+        if odom is not None and (
+            getattr(odom, "confidence", 0.0) <= 0.0
+            or abs(math.degrees(getattr(odom, "dyaw", 0.0)))
+            > cfg.memory_max_yaw_deg
+        ):
+            # We turned (or we do not know whether we turned). Either way the
+            # stored grids no longer describe the frame we are in.
+            self.forget_memory()
         nx = max(1, int(cfg.grid_forward_m / cfg.cell_m))
         ny = max(1, int(2 * cfg.grid_half_width_m / cfg.cell_m))
         occ = np.zeros((ny, nx), bool)
@@ -217,16 +230,22 @@ class DepthCostmap:
 
         n, d = self._fit_ground(pts)
         if n is None:
-            # No plane: fall back to treating the camera's own horizontal
-            # level as ground. Conservative — sees more as obstacle, not less.
-            n = np.array([0.0, -1.0, 0.0], np.float32)
-            d = -float(np.percentile(pts[:, 1], 90))
+            # No plane: do NOT invent a fake ground from camera-horizontal.
+            # That treated every near-field dirt pixel as an obstacle (10,681
+            # pts / 0.92 m stop on a floor the rover can roll). Blind geometry
+            # is unknown, not occupied; semantics `hard` still adds hazards.
             ground_found = False
+            geo_obs = np.zeros(len(pts), bool)
+            d = 0.0
         else:
             ground_found = True
-
-        height = pts @ n - d
-        geo_obs = (height > cfg.obstacle_height_m) & (height < cfg.max_height_m)
+            height = pts @ n - d
+            geo_obs = (height > cfg.obstacle_height_m) & (height < cfg.max_height_m)
+            # The camera is 15 cm up, so roots 5-25 cm tall at 0.3-0.7 m sit
+            # above a valid plane and read as a wall (9k pts / 0.68 m stop on
+            # rollable dirt). Real obstacles in that band are taller.
+            z = pts[:, 2]
+            geo_obs = geo_obs & ~((z < 0.70) & (height < 0.32))
         # Semantics can only ADD hazards, never clear a geometric one: if the
         # segmenter calls a boulder "earth", the boulder still stops us.
         is_obs = geo_obs | hard_pt
@@ -284,11 +303,7 @@ class DepthCostmap:
 
     # ---- the veto ---------------------------------------------------------
     def veto(self, result: CostmapResult, candidates) -> np.ndarray:
-        """
-        GeNIE Module 6: drop any candidate whose path crosses occupied space.
-
-        Returns a boolean mask, True = safe to keep.
-        """
+        """Drop any candidate crossing occupied space. True = safe to keep."""
         cfg = self.cfg
         occ = result.occupied
         ny, nx = occ.shape
@@ -301,7 +316,8 @@ class DepthCostmap:
             wp = np.asarray(cand.waypoints, np.float32)
             gx = (wp[:, 0] / cfg.cell_m).astype(int)
             gy = ((wp[:, 1] + cfg.grid_half_width_m) / cfg.cell_m).astype(int)
-            inb = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
+            near = wp[:, 0] <= cfg.veto_range_m
+            inb = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny) & near
             if not inb.any():
                 continue
             # Inflate by the rover footprint: any obstacle cell within
@@ -316,10 +332,10 @@ class DepthCostmap:
 
     def offtrack_cost(self, result: CostmapResult, candidates) -> np.ndarray:
         """
-        Fraction of each candidate's waypoints landing on off-track surface.
+        Fraction of each candidate's waypoints on off-track surface.
 
-        A preference, not a rule: the rover should stay on the dirt track, but
-        must still be able to cross the verge to get around an obstacle.
+        A preference, not a rule: prefer the track, but stay able to cross the
+        verge to get around an obstacle.
         """
         cfg = self.cfg
         soft = result.offtrack

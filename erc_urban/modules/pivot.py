@@ -1,20 +1,14 @@
 """
 Dead-time tolerant in-place pivot.
 
-Measured against the live SDK on this rover:
-    * /data answers at ~17 Hz but the payload only REFRESHES at 2.0 Hz
-    * every reading is 0.80-1.44 s old (median 1.09 s)
+Measured: /data answers at ~17 Hz but the payload only refreshes at 2 Hz, and
+every reading is 0.8-1.4 s old (median 1.09 s). A proportional yaw loop closing
+around that dead time limit-cycles instead of converging.
 
-So a proportional yaw loop is closing around ~1.1 s of dead time. Any gain
-large enough to break stiction rotates the rover 60-100 deg before the first
-evidence of motion arrives, which is why the naive controller limit-cycled
-(+73 -> -84 -> -115 -> ...) and never drove anywhere.
-
-The fix is to stop closing the loop at tick rate. One burst, open loop, sized
-from a measured yaw rate; then halt and stay halted until the telemetry
-pipeline has certainly flushed; then measure what actually happened, update
-the rate estimate, and repeat. Converges in 2-3 bursts and cannot oscillate,
-because no correction is ever issued against stale data.
+So do not close the loop at tick rate. One open-loop burst sized from a
+measured yaw rate, halt until the telemetry pipeline has flushed, measure what
+actually happened, update the rate estimate, repeat. Converges in 2-3 bursts
+and cannot oscillate, because no correction is issued against stale data.
 """
 from __future__ import annotations
 
@@ -49,6 +43,9 @@ class PulsePivot:
         self.aim = aim
         self.tol_deg = tol_deg
         self.calibrated = False
+        # False during an open-loop turnaround: the compass flips while we
+        # spin, and learning from it makes every later burst the wrong length.
+        self.learn = True
 
         self._phase = "idle"
         self._burst_end = 0.0
@@ -69,12 +66,11 @@ class PulsePivot:
 
     def busy(self) -> bool:
         """
-        True while a burst/settle cycle is in flight.
+        True while a burst/settle cycle is in flight; never preempt it.
 
-        The caller must not preempt this. The bearing it sees is ~1.1 s old, so
-        mid-burst it still reflects the pre-burst heading; releasing control on
-        that reading aborts the pivot before it can measure anything, and the
-        rover oscillates forever without ever calibrating.
+        The caller's bearing is ~1.1 s old, so mid-burst it still reflects the
+        pre-burst heading. Releasing control on that reading aborts the pivot
+        before it can measure anything.
         """
         return self._phase in ("burst", "settle")
 
@@ -108,7 +104,8 @@ class PulsePivot:
                 and tel.hw_ts <= self._ts0
             ):
                 return 0.0, 0.0, "settle (awaiting fresh telemetry)"
-            self._learn(tel)
+            if self.learn:
+                self._learn(tel)
             self._phase = "idle"
             self.cycles += 1
 
@@ -146,12 +143,10 @@ class PulsePivot:
 
     def effective_tol(self) -> float:
         """
-        Finest heading the pivot can actually resolve.
+        Finest heading the pivot can resolve: one tick at the stiction floor.
 
-        One tick at the stiction floor is the smallest turn it can produce;
-        asking for better than that guarantees an endless hunt. Anything
-        finer is left to the forward controller, which steers continuously
-        and corrects heading far more precisely than stop-start pivoting.
+        Asking for better guarantees an endless hunt. Anything finer is left to
+        the forward controller, which steers continuously.
         """
         finest = (self.rate / max(self.ang, 1e-6)) * self.ang_floor * self.min_burst
         return max(self.tol_deg, 0.8 * finest)

@@ -1,34 +1,16 @@
 """
-Candidate scoring — how the K hypotheses are ranked.
+Candidate scoring — an explicit weighted sum over everything perception knows.
 
-WHY THIS IS ITS OWN MODULE
---------------------------
-Ranking was previously two lines inside MultiHypothesisPlanner: endpoint-bearing
-agreement with the goal, plus similarity to LogoNav's prediction. Benchmarked
-against human-teleoperated FrodoBots rides, that ranking came out WORSE THAN
-RANDOM -- 1.029 m median ADE against a uniformly random candidate's 0.757 m,
-reproduced on a second ride. A ranking worse than chance is not a small tuning
-problem; it actively misleads everything downstream, and it dragged the VLM
-selector's contribution from -29% to -3% once Probability Fusion mixed it back in.
+The previous ranking used only endpoint bearing plus similarity to LogoNav, and
+benchmarked WORSE THAN RANDOM against human-teleoperated rides (1.029 m median
+ADE vs 0.757 m for a uniformly random candidate, reproduced on a second ride).
+The cause was not a bad weight: only the endpoint entered, so a kerb-crossing
+path tied with a clean one, and traversability and clearance were consulted only
+as a post-hoc veto so they never affected ORDER at all.
 
-The cause was not a bad weight. It was that the score ignored almost everything
-the stack already knows:
-
-  * only the ENDPOINT bearing entered, so two paths reaching the same point by
-    completely different routes scored identically -- including one crossing a
-    kerb and one staying on pavement.
-  * traversability was consulted only as a binary veto AFTER ranking, so among
-    surviving candidates the one hugging a grass edge ranked as well as the one
-    down the middle of the path.
-  * obstacle clearance never entered the ranking at all, for the same reason.
-
-Perception was computing rich, per-candidate information and the ranking threw
-all of it away. This module puts it back, as an explicit weighted sum with each
-term normalised to a comparable scale, so the weights mean something and can be
-tuned against the benchmark rather than by feel.
-
-Every term is optional. With only a goal bearing it reduces to the old
-behaviour, which keeps it usable when semantics or depth are unavailable.
+Each term is normalised to roughly [-1, 0] so the weights are comparable and
+tunable against the benchmark. Every term is optional — with only a goal bearing
+this degrades to the old behaviour rather than inventing values.
 """
 from __future__ import annotations
 
@@ -73,26 +55,20 @@ class ScoreWeights:
     comparable and a weight of 1.0 means "as important as goal agreement".
     """
 
-    # Weights set from measurement, not taste. `eval.score_diag` reports the
-    # rank correlation of each term with "how close this candidate is to what a
-    # human actually drove", over teleoperated FrodoBots rides:
+    # Set from measurement (`eval.score_diag`), not taste. Rank correlation of
+    # each term against what a human actually drove: traversable +0.23 (helps on
+    # 68% of ticks), goal -0.36, smooth -0.32.
     #
-    #     traversable  rho +0.23, helps on 68% of ticks   -> trust it
-    #     goal         rho -0.36, helps on  2% of ticks   -> see below
-    #     smooth       rho -0.32, helps on  0% of ticks   -> was measuring the
-    #                                                        wrong thing; fixed
-    #
-    # The goal term is NOT deleted despite scoring worst, and the reason
-    # matters: that benchmark measures imitation of a human whose destination we
-    # do not know, so a goal-seeking term is penalised for pursuing OUR goal
-    # rather than theirs. It cannot validate goal-seeking, only safety. Its
-    # weight is reduced so perception outranks it, not removed -- a rover with
-    # no goal term wanders.
+    # The goal term survives scoring worst because that benchmark imitates a
+    # human whose destination we do not know, so it penalises a goal term for
+    # pursuing OUR goal. It can validate safety, not goal-seeking. Weight
+    # reduced so perception outranks it, not removed -- a rover with no goal
+    # term wanders.
     goal: float = 0.5
     prior: float = 0.6
-    traversable: float = 1.5      # highest, and the only term measured to help:
-                                  # wrong-surface driving is also the dominant
-                                  # sidewalk-violation failure mode (Sorokin)
+    traversable: float = 1.5      # highest: the only term measured to help, and
+                                  # wrong-surface driving is the dominant
+                                  # sidewalk-violation failure mode
     clearance: float = 0.8
     smooth: float = 0.15
 
@@ -101,10 +77,9 @@ class CandidateScorer:
     """
     Ranks candidates from everything currently known about the scene.
 
-    Deliberately separate from the veto. The veto answers "is this candidate
-    allowed"; this answers "which allowed candidate is best". Collapsing them
-    loses ordering information among the survivors, which is exactly what made
-    the old ranking sub-random.
+    Deliberately separate from the veto: the veto answers "is this candidate
+    allowed", this answers "which allowed candidate is best". Collapsing them
+    loses ordering among the survivors.
     """
 
     def __init__(self, weights: Optional[ScoreWeights] = None,
@@ -117,10 +92,9 @@ class CandidateScorer:
     # ---- individual terms (each returns <= 0, 0 = perfect) --------------
     def _goal(self, xy: np.ndarray, goal_bearing: float) -> float:
         """
-        Agreement with the desired direction, integrated along the path rather
-        than read off the endpoint. Two paths ending at the same place by
-        different routes must not score the same -- that equivalence is what
-        let a kerb-crossing candidate tie with a clean one.
+        Agreement with the desired direction, integrated ALONG the path, not
+        read off the endpoint — that equivalence let a kerb-crossing candidate
+        tie with a clean one.
         """
         d = np.linalg.norm(xy, axis=1)
         use = d > 0.05
@@ -148,14 +122,10 @@ class CandidateScorer:
         """
         Penalise CHANGE of curvature, not curvature.
 
-        The first version penalised the second difference, i.e. curvature
-        itself, which made it a second vote for "go straight" on top of the
-        goal term. Measured against human-driven rides it scored Spearman
-        -0.316 and helped on 0% of ticks -- because humans turn, and a term
-        that dislikes turning ranks every turn last.
-
-        Constant-curvature arcs (which is what the anchor fan is) should all be
-        equally smooth; only a path that changes its mind mid-way is jerky.
+        Penalising curvature itself is a second vote for "go straight" on top of
+        the goal term; measured at Spearman -0.316, helping on 0% of ticks,
+        because humans turn. Constant-curvature arcs are all equally smooth;
+        only a path that changes its mind mid-way is jerky.
         """
         if len(xy) < 4:
             return 0.0
@@ -204,9 +174,8 @@ def path_traversable_fractions(
     """
     Fraction of each candidate's path landing on drivable surface.
 
-    Same projection and densification the veto uses, but returned as a
-    CONTINUOUS value rather than a boolean. The veto needs a threshold; the
-    ranking needs the gradient, so it can prefer the middle of the path over
+    Same projection the veto uses, but CONTINUOUS: the veto needs a threshold,
+    the ranking needs the gradient so it can prefer the middle of the path over
     its edge instead of treating both as merely "allowed".
     """
     h, w = trav_mask.shape
@@ -227,30 +196,4 @@ def path_traversable_fractions(
         inb = ok & (u >= 0) & (u < w) & (v >= 0) & (v < h)
         if int(inb.sum()) >= 3:
             out[i] = float(trav_mask[v[inb], u[inb]].mean())
-    return out
-
-
-def path_clearances(candidates: list, costmap_result, cell_m: float,
-                    half_width_m: float) -> np.ndarray:
-    """
-    Distance from each candidate to the nearest occupied cell.
-
-    Again continuous where the veto is binary: among candidates that all avoid
-    obstacles, the one that passes a metre clear should outrank the one that
-    shaves past at the inflation radius.
-    """
-    occ = costmap_result.occupied
-    n = len(candidates)
-    far = float(occ.shape[1] * cell_m)
-    out = np.full(n, far, dtype=np.float64)
-    if not occ.any():
-        return out
-    oy, ox = np.nonzero(occ)
-    obs = np.stack([ox * cell_m, oy * cell_m - half_width_m], axis=1)
-    for i, c in enumerate(candidates):
-        wp = np.asarray(c.waypoints, dtype=np.float64)
-        if not len(wp):
-            continue
-        d = np.linalg.norm(obs[None, :, :] - wp[:, None, :], axis=2)
-        out[i] = float(d.min())
     return out

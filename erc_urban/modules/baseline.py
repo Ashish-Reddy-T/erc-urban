@@ -1,14 +1,8 @@
 """
-BASELINE (Stage 0): a runnable, ML-free loop that reaches GPS checkpoints.
-
-This is deliberately dumb but COMPLETE — it closes the loop end to end so you
-can validate the SDK harness, the control interface, and the scoring
-before any learned component exists. Every later stage replaces one piece
-of THIS with a paper-derived module, one at a time.
-
-M1 (BaselinePlanner): fan out K constant-curvature arcs; score each by how
-    well its endpoint bearing matches the goal bearing.
-M7 (PurePursuitController): waypoint tracking for later stages.
+BaselinePlanner: a fan of K constant-curvature arcs scored by endpoint bearing.
+    Used at every stage, not just Stage 0 — it is the anchor fan that
+    MultiHypothesisPlanner ranks with LogoNav, and LogoNav's own fallback.
+PurePursuitController: waypoint tracking.
 VillageGotoController: Stage-0 heading creep for rough village dirt paths.
 """
 from __future__ import annotations
@@ -23,9 +17,9 @@ class BaselinePlanner:
         n_pts: int = 8,
         max_curv: float = 0.9,
     ):
-        self.horizon_m = horizon_m
-        self.n_pts = n_pts
-        self.max_curv = max_curv
+        self.horizon_m = horizon_m    # distance to look ahead
+        self.n_pts = n_pts            # number of points to generate for representation of the arc upto `horizon_m`
+        self.max_curv = max_curv      # maximum curvature allowed for the arc
 
     def propose(self, obs: Observation, k: int) -> list[Candidate]:
         curvs = np.linspace(-self.max_curv, self.max_curv, k)
@@ -54,10 +48,10 @@ class PurePursuitController:
         wheelbase_scale: float = 0.35,
         max_angular: float = 0.25,
     ):
-        self.lookahead_m = lookahead_m
-        self.v_nom = v_nom
-        self.k = wheelbase_scale
-        self.max_angular = max_angular
+        self.lookahead_m = lookahead_m  # distance to look ahead for the target waypoint
+        self.v_nom = v_nom              # nominal velocity
+        self.k = wheelbase_scale        # wheelbase scale factor
+        self.max_angular = max_angular  # maximum angular velocity
 
     def command(self, waypoints: np.ndarray) -> tuple[float, float]:
         d = np.linalg.norm(waypoints, axis=1)
@@ -67,19 +61,15 @@ class PurePursuitController:
         L2 = x * x + y * y
         curv = 0.0 if L2 < 1e-6 else (2.0 * y) / L2
         angular = float(np.clip(self.k * curv, -self.max_angular, self.max_angular))
-        # Floor was 0.4: a saturated turn cut throttle to 40% of v_nom on every
-        # LogoNav tick, so the rover crept and GPS never showed progress.
-        turn_scale = max(0.6, 1.0 - abs(angular) / max(self.max_angular, 1e-6))
+        # 0.6 floor, not 0.4: at 0.4 a saturated turn cut throttle to 40% of - changed to 0.7
+        # v_nom on every LogoNav tick and the rover crept.
+        turn_scale = max(0.7, 1.0 - abs(angular) / max(self.max_angular, 1e-6)) # Reduce speed linearly to 0.7 min as angular (turn rate) increases
         linear = float(np.clip(self.v_nom * turn_scale, 0.0, 1.0))
         return linear, angular
 
 
 class VillageGotoController:
-    """
-    Stage-0 creep controller. Prefer fused bearing from dirt-path + GPS
-    (see run.py). Never drives when caller passes blocked=True.
-    """
-
+    """Stage-0 creep controller. Never drives when blocked=True."""
     def __init__(
         self,
         v_creep: float = 0.22,

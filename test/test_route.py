@@ -140,3 +140,72 @@ class TestFrozenGpsScenario(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpenGroundIsNotACorridor(unittest.TestCase):
+    """
+    Measured live on a grass field, and it cost a checkpoint.
+
+    `semantics.corridor` found every column open and reported a corridor of
+    width 1.00 — the whole frame. `RouteAligner` scored that at full confidence
+    and then, per the corridor policy, allowed the goal to move the aim by at
+    most `goal_bias_max_deg`. Logged: src=corridor(1.00@+8deg) with the goal at
+    +90deg and cmd ang=0.02, about 2 deg/s of correction against a 90 degree
+    error. The rover drove a straight line past the checkpoint with every gate
+    reporting clear, and the range grew 24.4 m -> 30.5 m.
+
+    A corridor spanning the whole frame is not a corridor. It is open ground,
+    and open ground imposes no lateral constraint on where to drive.
+    """
+
+    def test_a_corridor_is_defined_by_its_edges(self):
+        """
+        Width alone cannot tell a wide path from open ground — both score high.
+        Edges can: `corridor()` returns the longest run of drivable columns, so
+        1.00 means no column anywhere was closed and there is nothing to follow.
+        A wide corridor with real edges must keep full confidence.
+        """
+        r = RouteAligner()
+        self.assertEqual(r.confidence(0.05), 0.0)     # too narrow to be real
+        self.assertEqual(r.confidence(0.50), 1.0)     # a genuine corridor
+        self.assertEqual(r.confidence(0.90), 1.0)     # wide, but it has edges
+        self.assertEqual(r.confidence(0.994), 0.0)    # one stray closed column
+        self.assertEqual(r.confidence(1.00), 0.0)     # no edges at all
+
+    def test_full_frame_corridor_yields_the_goal_bearing(self):
+        r = RouteAligner()
+        aim = r.align(goal_bearing=math.radians(90.0),
+                      corridor_bearing=math.radians(8.0), corridor_width=1.00,
+                      track_bearing=0.0, track_frac=1.00, goal_trusted=True)
+        self.assertEqual(aim.confidence, 0.0)
+        self.assertAlmostEqual(math.degrees(aim.bearing), 90.0, places=3)
+
+    def test_a_real_corridor_still_wins(self):
+        """The behaviour that matters on a sidewalk must be untouched."""
+        r = RouteAligner()
+        aim = r.align(goal_bearing=math.radians(90.0),
+                      corridor_bearing=math.radians(8.0), corridor_width=0.50,
+                      track_bearing=0.0, track_frac=0.60, goal_trusted=True)
+        self.assertEqual(aim.source, "corridor")
+        self.assertEqual(aim.confidence, 1.0)
+        self.assertLess(abs(math.degrees(aim.bearing)), 20.0)
+
+    def test_saturated_near_band_is_not_a_track_bearing(self):
+        """
+        `semantics.track` returns the centroid of traversable pixels, so when
+        the whole band is traversable the centroid is the middle of the frame
+        by construction. Live, that printed as `@+0deg` on every tick while the
+        goal sat 90 degrees away. It is an artifact, not an observation.
+        """
+        r = RouteAligner()
+        aim = r.align(goal_bearing=math.radians(90.0), corridor_bearing=None,
+                      corridor_width=0.0, track_bearing=0.0, track_frac=1.00,
+                      goal_trusted=True)
+        self.assertEqual(aim.source, "gps")
+
+    def test_a_discriminating_track_still_steers(self):
+        r = RouteAligner()
+        aim = r.align(goal_bearing=math.radians(90.0), corridor_bearing=None,
+                      corridor_width=0.0, track_bearing=math.radians(20.0),
+                      track_frac=0.30, goal_trusted=True)
+        self.assertEqual(aim.source, "track")

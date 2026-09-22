@@ -1,11 +1,9 @@
 """
-LogoNav planner adapter
+LogoNav planner adapter.
 
 Loads IL_gps / LogoNav from ERC-3-earthrover-challenge/mbra_repo, runs the same
-GPS-conditioned inference as OutdoorLogoNavController, and emits robot-frame
-waypoint Candidates. Dirt-path / gates stay outside this module.
-
-Falls back to BaselinePlanner arcs if weights or torch are missing.
+GPS-conditioned inference, and emits robot-frame waypoint Candidates. Falls back
+to BaselinePlanner arcs when weights or torch are missing.
 """
 from __future__ import annotations
 
@@ -49,10 +47,10 @@ def _rotate_local(dx: float, dy: float, heading_rad: float) -> tuple[float, floa
 
 class LogoNavPlanner:
     """
-    M1 drop-in: GPS-conditioned LogoNav → Candidates.
+    GPS-conditioned LogoNav -> Candidates.
 
-    Primary candidate = LogoNav trajectory (high score). Remaining slots are
-    BaselinePlanner arcs so DirtPathGate can still reject grass-crossing paths.
+    The LogoNav trajectory scores highest; the remaining slots are
+    BaselinePlanner arcs, so a gate still has grass-crossing paths to reject.
     """
 
     def __init__(
@@ -142,16 +140,16 @@ class LogoNavPlanner:
         # Put LogoNav first with a high score; keep remaining baseline arcs.
         return ([logo] + base)[: max(k, 1)]
 
-    # ---- pieces reused by the K-candidate sampler (modules/candidates.py) ----
+    # ---- reused by the K-candidate sampler (modules/candidates.py) ---------
 
     def update_context(self, obs: Observation) -> bool:
         """
-        Push this frame into the context queue. True once the queue is deep
-        enough for the model to run.
+        Push this frame into the context queue; True once it is deep enough to
+        run the model.
 
-        Split out of `_logo_candidate` so the multi-hypothesis sampler can
-        advance the SAME queue exactly once per tick. Calling it twice would
-        feed the model duplicate frames and corrupt the temporal context.
+        Split out of `_logo_candidate` so the multi-hypothesis sampler advances
+        the SAME queue exactly once per tick — calling it twice feeds the model
+        duplicate frames and corrupts the temporal context.
         """
         if self.model is None:
             return False
@@ -174,20 +172,17 @@ class LogoNavPlanner:
         The model's 4-vector conditioning input, optionally aimed at a point
         offset from the true GPS goal.
 
-        Layout, verified against upstream `LogoNav_frodobot.py:121` and the
-        training dataloader `vint_hf_dataset.py:662-670`:
+        Layout, verified against upstream and the training dataloader:
 
             [forward_m / 0.25, left_m / 0.25, cos(dheading), sin(dheading)]
 
         Both the action labels and the goal position are divided by
-        `metric_waypoint_spacing = 0.25` during training, which is why the same
-        constant de-normalises the output back to metres in `forward_batch`.
+        `metric_waypoint_spacing = 0.25` in training, which is why the same
+        constant de-normalises the output in `forward_batch`.
 
-        `lateral_offset_m` shifts the aim point sideways (left-positive). That
-        is the diversity axis the whole K-candidate scheme rides on: a metre of
-        lateral offset asks the policy "what would you do if the goal were a
-        metre to the left", and the answers differ exactly where it matters —
-        which side of a pedestrian, which edge of the sidewalk.
+        `lateral_offset_m` shifts the aim point sideways (left-positive) — the
+        diversity axis the K-candidate scheme rides on: it asks the policy what
+        it would do if the goal were a metre to the left.
         """
         if self.goal_latlon is None:
             return None
@@ -210,22 +205,19 @@ class LogoNavPlanner:
         # offsets below are obviously in robot frame rather than a swapped one.
         fwd, left = relative_y, -relative_x
 
-        # Cap the aim point to the range the policy was trained on, BEFORE
-        # applying any perturbation. Order matters and is not obvious: the cap
-        # is a proportional rescale, so offsetting first would shrink the
-        # offset by the same factor. A checkpoint 111 m out caps to 30 m and
-        # would turn a 2 m lateral offset into 0.54 m; at 300 m it collapses
-        # tenfold, and the whole candidate set degenerates to near-duplicates
-        # exactly when the goal is far and diversity matters most.
+        # Cap to the trained range BEFORE perturbing. The cap is a proportional
+        # rescale, so offsetting first shrinks the offset by the same factor: a
+        # checkpoint 111 m out would turn a 2 m lateral offset into 0.54 m, and
+        # the candidate set degenerates to near-duplicates exactly when the goal
+        # is far and diversity matters most.
         dist = math.hypot(fwd, left)
         if dist > self.goal_distance_cap_m and dist > 1e-6:
             scale = self.goal_distance_cap_m / dist
             fwd, left = fwd * scale, left * scale
 
-        # Applied to the capped point, so an offset always means what it says
-        # in metres of robot-frame displacement. The small overshoot past the
-        # cap (30 m aim + 3 m lateral = 30.1 m) is well inside the policy's
-        # range and is not worth a second rescale.
+        # Applied to the capped point, so an offset means what it says in
+        # metres. The overshoot (30 m aim + 3 m lateral = 30.1 m) is well inside
+        # the policy's range.
         fwd += forward_offset_m
         left += lateral_offset_m
 
@@ -242,17 +234,15 @@ class LogoNavPlanner:
 
     def forward_batch(self, goal_poses: np.ndarray) -> Optional[np.ndarray]:
         """
-        Run the policy on B goal poses at once → (B, T, 2) robot-frame metres.
+        Run the policy on B goal poses at once -> (B, T, 2) robot-frame metres.
 
-        The B goal poses share one image context, and the vision encoder is by
-        far the expensive half (EfficientNet-B0 over context_size+1 frames).
-        Batching the model's own `forward` would re-encode those same frames B
-        times: measured 971 ms at B=11 on CPU, against a 200 ms tick. So we
-        encode once and fan out only the cheap decoder head — see
-        `_encode_context` / `_decode`.
+        The B poses share one image context and the vision encoder is the
+        expensive half, so batching the model's own `forward` would re-encode
+        the same frames B times — measured 971 ms at B=11 on CPU against a
+        200 ms tick. Encode once, fan out only the cheap decoder head.
 
-        Falls back to the plain batched forward if the fast path can't run, so
-        a change in the upstream model can only cost speed, never correctness.
+        Falls back to the plain batched forward when the fast path cannot run,
+        so an upstream change can only cost speed, never correctness.
         """
         if self.model is None or len(self.context_queue) <= self.context_size:
             return None
@@ -286,10 +276,9 @@ class LogoNavPlanner:
         # Robot-frame metres (x_forward, y_left) — matches ERC-3 twist decode.
         return np.asarray(wps[:, :, :2], dtype=np.float64) * self.metric_waypoint_spacing
 
-    # The next two mirror IL_gps.forward (mbra_repo il.py:213) split at the
-    # goal-conditioning point. Kept deliberately literal against upstream so a
-    # side-by-side diff is easy; `test_candidates` asserts they reproduce
-    # model(...) exactly.
+    # The next two mirror IL_gps.forward, split at the goal-conditioning point.
+    # Kept literal against upstream so a side-by-side diff is easy;
+    # test_candidates asserts they reproduce model(...) exactly.
     def _encode_context(self, obs_img):
         """Vision half of IL_gps.forward — independent of the goal, so once."""
         import torch
@@ -317,8 +306,8 @@ class LogoNavPlanner:
         action_pred = action_pred.reshape(
             (action_pred.shape[0], m.len_trajectory_pred, m.num_action_params)
         )
-        # Deltas -> waypoints, then unit-normalise the heading pair. Same order
-        # as upstream; the clone avoids an in-place write on an expanded view.
+        # Deltas -> waypoints, then unit-normalise the heading pair. The clone
+        # avoids an in-place write on an expanded view.
         action_pred = torch.cat(
             [
                 torch.cumsum(action_pred[:, :, :2], dim=1),
@@ -330,9 +319,10 @@ class LogoNavPlanner:
 
     def score_waypoints(self, xy: np.ndarray, obs: Observation) -> float:
         """
-        Planner confidence for one path: how well its endpoint bearing agrees
-        with the GPS goal bearing. Offset by 2.0 so any model path outranks the
-        geometric arcs, which score <= 0 (see BaselinePlanner.propose).
+        Planner confidence: how well the endpoint bearing agrees with the goal.
+
+        Offset by 2.0 so any model path outranks the geometric arcs, which score
+        <= 0 (see BaselinePlanner.propose).
         """
         end_bearing = float(np.arctan2(xy[-1, 1], max(xy[-1, 0], 1e-3)))
         return 2.0 - abs(_clip_angle(end_bearing - obs.goal_bearing))

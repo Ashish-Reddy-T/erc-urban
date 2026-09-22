@@ -1,32 +1,26 @@
 """
-Oracle gap — the keystone validation. `python -m erc_urban.eval.oracle_gap --ep runs/ep1`
+Oracle gap. `python -m erc_urban.eval.oracle_gap --ep runs/ep1`
 
-plan.md makes the K-candidate set the load-bearing requirement for M4/M5: if the
-planner's own pick is already as good as the best candidate available, then a
-selector has nothing to select and the whole VLM layer is decoration. Slow-Brain
-report the gap they exploit as 1.64 m (planner top-1) vs 0.39 m (oracle best).
-This measures the same quantity on our stack.
+If the planner's own pick is already as good as the best candidate available,
+a selector has nothing to select and the VLM layer is decoration.
 
-    top-1 ADE     = displacement error of the candidate the planner ranks first
-    oracle ADE    = displacement error of the BEST candidate in the set
-    gap           = top-1 - oracle = headroom a perfect selector could recover
+    top-1 ADE   = error of the candidate the planner ranks first
+    oracle ADE  = error of the BEST candidate in the set
+    gap         = top-1 - oracle, the headroom a perfect selector could recover
 
 REFERENCE TRAJECTORY, AND ITS HONEST LIMITATION
 -----------------------------------------------
-ADE needs a ground-truth future path. GPS on this rover is frozen, so the
-reference is reconstructed from visual odometry: chain the per-tick SE(2)
-deltas forward and express them in the frame of the tick being scored.
+GPS is frozen, so the reference is reconstructed from VO: chain the per-tick
+SE(2) deltas forward, expressed in the frame of the tick being scored.
 
-That reference is what the rover ACTUALLY DROVE, not what an expert would have
-driven. Recorded under a fixed command it is an arc, not a demonstration. So
-this measures two real things -- whether the candidate set COVERS the executed
-trajectory, and how much selection headroom exists within it -- but it is not a
-measure of expert imitation quality. Reading it as the latter would overclaim.
-Swapping in FrodoBots episodes with `action_mbra` labels would fix that, and the
-loader boundary here is where they would plug in.
+That is what the rover ACTUALLY DROVE, not what an expert would have. Recorded
+under a fixed command it is an arc, not a demonstration — so this measures
+whether the candidate set COVERS the executed trajectory and how much selection
+headroom exists within it, NOT expert imitation quality. Reading it as the
+latter would overclaim; teleoperated episodes are the fix.
 
-Ticks whose VO confidence is zero are skipped: an unmeasured reference is worse
-than no reference, because it silently rewards candidates that match nothing.
+Ticks with zero VO confidence are skipped: an unmeasured reference silently
+rewards candidates that match nothing.
 """
 from __future__ import annotations
 

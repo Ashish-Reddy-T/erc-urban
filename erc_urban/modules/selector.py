@@ -1,60 +1,50 @@
 """
-Module 4 (+ M5 slow half) — VLM candidate selection with latency-resilient fusion.
+VLM candidate selection with latency-resilient fusion.
 
-Source: "Slow Brain, Fast Planner: Latency-Resilient VLM-Augmented Urban
-Navigation" (arXiv 2606.20458). Verified against the paper rather than
-paraphrased; every default below traces to one of their ablations.
-
-WHY IT EXISTS
--------------
 The planner's own scoring picks badly in exactly the situations that drive the
-difficulty rubric -- junctions, pedestrian encounters, sidewalk/grass edges.
-The paper measures a 30% ADE reduction from VLM selection over the planner's
-best pick, and our own oracle-gap probe reproduces the shape: on this stack,
-top-1 error is 16-22 deg where the oracle-best candidate is 0.1-2.1 deg, so
-there is 15-41 deg of headroom for a selector to exploit -- and exactly 0 deg on
-an unobstructed straight, matching their finding that the planner is already
-competitive in routine situations.
+difficulty rubric — junctions, pedestrians, sidewalk/grass edges. Our oracle-gap
+probe measured 15-41 deg of headroom at off-axis goals and exactly 0 deg on an
+unobstructed straight, so the planner is already competitive in routine
+situations and the VLM earns its keep at decision points.
 
-WHAT WE TOOK, AND WHY IT IS NOT OPTIONAL
-----------------------------------------
+The design, each part load-bearing:
+
 * Numbered overlays, VLM returns an index. Training-free.
-* Goal and planner scores are HIDDEN from the prompt. Their ablation: shown the
-  scores, the VLM defers to the planner's ranking instead of judging.
+* Goal and planner scores are HIDDEN from the prompt — shown the scores, the VLM
+  defers to the planner's ranking instead of judging.
 * Probability Fusion, not Score Fusion:
       p_fused = (1-a)*p_planner + a*p_vlm,   a = (lam/(lam+1)) * w(dt)
-  bounded by a <= 1. The paper prefers it because Score Fusion's similarity term
-  is unbounded and it is "markedly less sensitive to hyperparameter choice".
-* Exponential staleness decay w(dt) = exp(-dt/tau), tau = 5 s deployed.
-* Similarity with progress alignment and horizon truncation:
-      Sim = -(1/d_scale) * (1/N_use) * sum ||tau_i[n] - tau_vlm_hat[n]||
-  where tau_vlm_hat is the REMAINING segment of the stale trajectory after the
-  rover's progress is accounted for. The old `_traj_dist` in upgrades.py did
-  neither, so a stale pick was compared against paths starting from a position
-  the rover had already left.
+  bounded at a <= 1, because Score Fusion's similarity term is unbounded and far
+  more sensitive to hyperparameters.
+* Exponential staleness decay w(dt) = exp(-dt/tau), tau = 5 s.
+* Similarity with progress alignment and horizon truncation, comparing against
+  the REMAINING segment of the stale trajectory. Without both, a stale pick is
+  scored against paths starting from a position the rover has already left.
 
-ASYNCHRONY IS A HARD REQUIREMENT HERE
--------------------------------------
-Measured on this rover: it has a command watchdog. A single /control POST yields
-+0.7 deg of yaw; streaming the same command at 2 Hz yields +12.2 deg and at 5 Hz
-+18.6 deg. Command RATE is effective speed. A VLM call takes 1-3 s, so running
-it inside the control tick would drop the command rate by an order of magnitude
-and physically slow the rover to a crawl. The query therefore runs on its own
-thread and the tick consumes whatever answer is already available.
+ASYNCHRONY IS A HARD REQUIREMENT
+--------------------------------
+This rover has a command watchdog: a single /control POST yields +0.7 deg of
+yaw, the same command streamed at 5 Hz yields +18.6 deg. Command RATE is
+effective speed, and a VLM call takes 1-3 s, so an in-tick call would drop the
+rate by an order of magnitude and physically slow the rover to a crawl. The
+query runs on its own thread; the tick consumes whatever answer is ready.
 """
 from __future__ import annotations
 
+import json
+import math
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Callable, Optional
 
 import numpy as np
 
 from ..interfaces import Candidate, Observation
 
-# Distinct, high-contrast, and colour-blind-tolerable. Deliberately not a
-# rainbow ramp: adjacent candidates must be told apart at a glance, and the VLM
-# is being asked to name one.
+# Deliberately not a rainbow ramp: adjacent candidates must be distinguishable
+# at a glance, since the VLM is being asked to name one.
 _PALETTE = [
     (255, 64, 64), (64, 200, 255), (255, 200, 0), (120, 255, 120),
     (255, 128, 220), (180, 160, 255), (255, 150, 60), (0, 220, 190),
@@ -76,22 +66,14 @@ def render_overlay(
     Draw the candidate set onto the frame as numbered coloured polylines.
 
     This is the entire interface between our geometry and the VLM's judgement,
-    so a mis-projected overlay is worse than no overlay: the model answers
-    confidently about a path that is not where we will actually drive. It is
-    also why calib.py exists -- the previous `_render_overlay` in upgrades.py
-    returned the raw frame unchanged, giving the VLM nothing to select over.
+    so a mis-projected overlay is worse than none: the model answers confidently
+    about a path that is not where we will drive.
 
-    Follows the paper's rendering: coloured polyline per candidate, a dot at the
-    endpoint, and an integer index on a colour-matched background.
-
-    `label_range_m` is a deviation forced by this camera. The paper labels
-    endpoints, but at 148 mm height the ground compresses brutally with range:
-    measured, image row 350 is 0.74 m and row 300 is 1.99 m, with the horizon at
-    270. A 2.5 m endpoint therefore lands within ~30 px of the horizon, so
-    labelling endpoints stacks every number into a thin band against the
-    buildings, where they are hard to associate with any ground position. The
-    fan is visibly separated around 1 m, so the label goes there instead --
-    same information, placed where a reader can actually use it.
+    `label_range_m` is forced by this camera. Labelling endpoints is standard,
+    but at 148 mm height the ground compresses brutally with range — image row
+    350 is 0.74 m, row 300 is 1.99 m, horizon at 270 — so a 2.5 m endpoint lands
+    within ~30 px of the horizon and every number stacks into a thin band
+    against the buildings. The fan is visibly separated around 1 m.
     """
     try:
         import cv2
@@ -127,46 +109,94 @@ def render_overlay(
 
         label = str(i)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, label_px, 2)
-        # Stagger across three rows. The ground is so foreshortened at this
-        # camera height that a whole fan of labels lands within ~40 px
-        # vertically and they overprint each other; a VLM cannot pick an index
-        # it cannot read. Staggering costs nothing and keeps them legible.
+        # Stagger across three rows: at this camera height a whole fan of
+        # labels lands within ~40 px vertically and overprints, and a VLM
+        # cannot pick an index it cannot read.
         row = (i % 3) * (th + 7)
         lx = int(np.clip(anchor[0] - tw // 2, 2, w - tw - 4))
         ly = int(np.clip(anchor[1] + th + 6 + row, th + 4, h - 4))
         cv2.rectangle(img, (lx - 3, ly - th - 3), (lx + tw + 3, ly + 4), colour, -1)
-        # Dark text on bright fills, light on dark: the index has to be legible
-        # or the VLM is guessing at which number it is looking at.
+        # Dark text on bright fills, light on dark, or the VLM is guessing at
+        # which number it is looking at.
         lum = 0.299 * colour[0] + 0.587 * colour[1] + 0.114 * colour[2]
         cv2.putText(img, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, label_px,
                     (0, 0, 0) if lum > 140 else (255, 255, 255), 2, cv2.LINE_AA)
     return img
 
 
+def _endpoint_spread_deg(cands: list[Candidate]) -> float:
+    """Angular span of candidate endpoints. Score ties on the same heading are
+    not a decision; only paths that go different ways are."""
+    angs = []
+    for c in cands:
+        xy = np.asarray(c.waypoints)
+        if len(xy) == 0:
+            continue
+        angs.append(math.degrees(math.atan2(float(xy[-1, 1]),
+                                            max(float(xy[-1, 0]), 1e-3))))
+    if len(angs) < 2:
+        return 0.0
+    return float(max(angs) - min(angs))
+
+
+def dump_candidates(
+    out_dir: str,
+    frame: np.ndarray,
+    cands: list[Candidate],
+    calib,
+    chosen_idx: Optional[int] = None,
+    extra: Optional[dict] = None,
+) -> None:
+    """Write latest overlay + waypoint JSON so a live run is inspectable."""
+    os.makedirs(out_dir, exist_ok=True)
+    img = render_overlay(frame, cands, calib)
+    try:
+        import cv2
+        cv2.imwrite(
+            os.path.join(out_dir, "latest.jpg"),
+            cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
+        )
+    except Exception:
+        return
+    payload = {
+        "chosen": chosen_idx,
+        "n": len(cands),
+        "paths": [
+            {
+                "i": i,
+                "score": float(c.score),
+                "end_m": [float(c.waypoints[-1, 0]), float(c.waypoints[-1, 1])],
+                "xy": np.asarray(c.waypoints, float).round(2).tolist(),
+            }
+            for i, c in enumerate(cands)
+        ],
+    }
+    if extra:
+        payload.update(extra)
+    with open(os.path.join(out_dir, "latest.json"), "w") as f:
+        json.dump(payload, f)
+
+
 PROMPT = (
-    "You are helping a small ground robot drive on streets and sidewalks.\n"
-    "The image shows several possible short paths the robot could take, each "
+    "You are helping a small ground robot drive outdoors.\n"
+    "The image shows several possible paths the robot could take, each "
     "drawn as a coloured line with a number at its end.\n\n"
     "Choose the ONE numbered path that is safest and most sensible to drive "
     "now. Prefer paths that:\n"
-    "- stay on drivable surface (pavement, sidewalk, road) and avoid grass, "
-    "kerbs, steps and drops\n"
-    "- keep clear of people, animals, vehicles and obstacles\n"
-    "- follow the direction the walkway or road actually goes\n\n"
+    "- stay on surface the robot can roll on (dirt, pavement, short vegetation)\n"
+    "- stay clear of people, animals, vehicles, walls, water, steps and drops\n"
+    "- follow the opening that continues farthest ahead\n\n"
     "Reply with ONLY the number. No explanation."
 )
 
 
 class GeminiVertexVLM:
     """
-    Gemini on Vertex AI, so the calls bill against existing GCP credits rather
-    than a separate AI Studio key.
+    Gemini on Vertex AI, so calls bill against existing GCP credits rather than
+    a separate AI Studio key.
 
-    Model default is `gemini-3.5-flash-lite`: the paper's ablation picks the
-    Flash-Lite tier for the latency/quality sweet spot (1.7 s median), and at
-    $0.30/1M input this is roughly $1.60 per driving hour at 1 Hz.
-
-    Requires `aiplatform.googleapis.com` enabled on the project:
+    Flash-Lite is the latency/quality sweet spot at ~1.7 s median, roughly $1.60
+    per driving hour at 1 Hz. Needs aiplatform.googleapis.com enabled:
         gcloud services enable aiplatform.googleapis.com --project <PROJECT>
     """
 
@@ -220,13 +250,27 @@ class GeminiVertexVLM:
             if not ok:
                 return None
             t0 = time.monotonic()
-            resp = client.models.generate_content(
-                model=self.model,
-                contents=[
-                    types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
-                    PROMPT,
-                ],
-            )
+
+            def _gen():
+                return client.models.generate_content(
+                    model=self.model,
+                    contents=[
+                        types.Part.from_bytes(
+                            data=buf.tobytes(), mime_type="image/jpeg"
+                        ),
+                        PROMPT,
+                    ],
+                )
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_gen)
+                try:
+                    resp = fut.result(timeout=self.timeout_s)
+                except FuturesTimeout:
+                    self.n_errors += 1
+                    self.last_error = f"timeout({self.timeout_s:.0f}s)"
+                    self.last_latency_s = time.monotonic() - t0
+                    return None
             self.last_latency_s = time.monotonic() - t0
             self.n_calls += 1
             digits = "".join(ch for ch in (resp.text or "") if ch.isdigit())
@@ -251,14 +295,14 @@ def _softmax(x: np.ndarray) -> np.ndarray:
 def _similarity(cand: np.ndarray, stale: np.ndarray, progress_m: float,
                 d_scale: float) -> float:
     """
-    Paper's Sim, with the two pieces the old implementation omitted.
+    Similarity to the stale VLM pick, with the two pieces that matter.
 
-    progress alignment: the rover has driven `progress_m` along the stale
-    trajectory since it was chosen, so compare against the REMAINING segment.
-    Without it, every fresh candidate is scored against a path that starts
-    behind the rover, and the stale pick is penalised for the robot having moved.
+    Progress alignment: the rover has driven `progress_m` along the stale
+    trajectory since it was chosen, so compare against the REMAINING segment, or
+    every fresh candidate is scored against a path starting behind the rover and
+    the stale pick is penalised for the robot having moved.
 
-    horizon truncation: only compare over the overlapping horizon N_use.
+    Horizon truncation: only compare over the overlapping horizon.
     """
     stale = np.asarray(stale, dtype=np.float64)
     if len(stale) < 2:
@@ -276,11 +320,9 @@ def _similarity(cand: np.ndarray, stale: np.ndarray, progress_m: float,
 
 class VLMSelector:
     """
-    M4 + M5(slow). Honors the `Selector` protocol: select(obs, cands) -> index.
-
-    Supersedes `upgrades.VLMSelectorFusion`, whose fusion algebra was already
-    right but whose overlay was a no-op and whose similarity had neither
-    progress alignment nor horizon truncation.
+    select(obs, cands) -> index. Supersedes `upgrades.VLMSelectorFusion`, whose
+    fusion algebra was right but whose overlay was a no-op and whose similarity
+    had neither progress alignment nor horizon truncation.
     """
 
     def __init__(
@@ -294,8 +336,9 @@ class VLMSelector:
         max_stale_s: float = 15.0,
         gate_queries: bool = True,
         contest_ratio: float = 0.25,
-        hazard_frac: float = 0.01,
+        hazard_frac: float = 0.08,
         ambiguous_corridor: float = 0.25,
+        min_spatial_spread_deg: float = 25.0,
     ):
         self.calib = calib
         self.vlm_call = vlm_call
@@ -313,6 +356,7 @@ class VLMSelector:
         self.contest_ratio = contest_ratio
         self.hazard_frac = hazard_frac
         self.ambiguous_corridor = ambiguous_corridor
+        self.min_spatial_spread_deg = min_spatial_spread_deg
         self.n_queries = 0
         self.n_answers = 0
         self.n_skipped = 0
@@ -330,29 +374,24 @@ class VLMSelector:
         """
         Should the VLM be consulted at all on this tick?
 
-        The VLM is a HIGH-LEVEL planner, not a per-tick controller. Querying it
-        everywhere is wasteful on three axes -- API cost, 1.6-2.1 s of staleness,
-        and (because the rover has a command watchdog) tick rate, which is
-        literally speed. It is also unnecessary: Slow-Brain's own result is that
-        the planner is already competitive in routine situations and the VLM
-        earns its keep at junctions, pedestrian encounters and surface
-        boundaries. Our oracle-gap probe reproduced exactly that shape -- 15-41
-        deg of headroom at off-axis goals, and 0 deg on an unobstructed straight.
+        It is a high-level planner, not a per-tick controller, and querying it
+        everywhere costs API spend, 1.6-2.1 s of staleness, and tick rate — which
+        on a watchdogged rover is literally speed. So query where the decision is
+        contested and stay quiet on an empty path. Any of three triggers fires:
 
-        So: query where the decision is genuinely contested, and stay quiet on
-        an empty path. Three independent triggers, any of which fires:
-
-          1. the candidate set disagrees -- top scores are close, so the
-             planner itself has no strong opinion
-          2. a hazard is visible (person, vehicle, water) in the near field
-          3. the corridor is ambiguous -- narrow, or absent entirely
+          1. the candidate set disagrees — top scores close, so the planner
+             itself has no strong opinion
+          2. a hazard is visible in the near field
+          3. the corridor is ambiguous — narrow, or absent entirely
         """
         if len(cands) < 2:
             return False, "single_candidate"
         scores = np.sort(np.array([c.score for c in cands], dtype=np.float64))[::-1]
         margin = float(scores[0] - scores[1])
         spread = float(scores[0] - scores[-1])
-        contested = spread > 1e-9 and (margin / spread) < self.contest_ratio
+        score_close = spread > 1e-9 and (margin / spread) < self.contest_ratio
+        spatial = _endpoint_spread_deg(cands)
+        contested = score_close and spatial >= self.min_spatial_spread_deg
 
         if hazard_frac >= self.hazard_frac:
             return True, f"hazard({hazard_frac:.2f})"

@@ -1,68 +1,39 @@
 """
-Module 5a — planar visual odometry from the ground plane.
+Planar visual odometry from the ground plane — the only working motion sensor
+on this rover.
 
-WHY THIS EXISTS
----------------
-plan.md's M5 says to fix `PoseBuffer` by integrating wheel RPM and yaw rate.
-Neither is available on this rover. Measured on the live Mini+:
-
-  * `rpms` reads [0, 0, 0, 0] permanently, through 30 s of commanded driving
-  * `speed` is pinned at 0
-  * `latitude`/`longitude` are bit-identical across 24 stationary samples AND
-    across that same 30 s of driving
-  * the compass ran to -141 deg then reversed to -7 deg while the rover was
-    commanded one direction throughout (magnetometer interference)
-
-So every odometry source the plan assumed is either dead or untrustworthy. The
-one sensor that demonstrably works is the camera, and the rover drives on a
-plane whose geometry we now know: `calib.image_to_ground` converts a ground
-pixel to robot-frame metres exactly. Tracking ground texture between frames
-therefore yields real displacement -- this is the same measurement used to
-establish that GPS was frozen in the first place.
-
-WHAT IT FEEDS
--------------
-  * `PoseBuffer` (M5 transport). Today run.py pushes `(stamp, 0.0, 0.0, yaw)`,
-    so AsyncShield's SE(2) realignment has an identically-zero translation term
-    and does nothing but rotate.
-  * The breadcrumb trail, so a recovery manoeuvre can retrace ground the rover
-    has already driven over instead of reversing blind. `/v2/screenshot`
-    returns no rear frame, and a blind 15-tick reverse put this rover into a
-    staircase.
-  * Range-to-goal when GPS is frozen: dead-reckoned displacement is the only
-    thing that can move `rng` off its pinned value.
+Every alternative is dead or untrustworthy. Measured: `rpms` reads [0,0,0,0]
+through 30 s of commanded driving, `speed` is pinned at 0, lat/lon are
+bit-identical across both 24 stationary samples and that same 30 s, and the
+compass ran to -141 deg then back to -7 deg while commanded one way throughout.
+The camera works, and `calib.image_to_ground` converts a ground pixel to
+robot-frame metres exactly, so tracking ground texture yields real displacement.
 
 METHOD
 ------
-Track corners in the ground region (below the horizon, inside the depth-
-trustworthy band), lift both frames' points to robot-frame metres, then fit the
-rigid 2-D motion that maps one to the other (Kabsch). A world-fixed point seen
-from a rover that moved by (t, dyaw) appears at
+Track corners in the ground region, lift both frames to robot-frame metres, then
+fit the rigid 2-D motion mapping one to the other (Kabsch). A world-fixed point
+seen from a rover that moved by (t, dyaw) appears at
 
     q = R(-dyaw) @ (p - t)
 
-so we solve for R and t directly, then invert to get the rover's motion.
+so solve for R and t, then invert for the rover's motion.
 
-Honest about failure, with measured limits:
+MEASURED LIMITS
+---------------
+  * Stationary is clean: 0.01 cm and 0.0 deg of drift over six frames 1.5 s
+    apart, and identical frames give exactly zero. No phantom motion.
+  * Per-frame motion above ~0.1 m loses tracking, because near-field ground
+    under a 148 mm camera changes scale fast. At the measured ~1.5 Hz loop and
+    0.3 m/s a tick is 0.2 m, so VO will drop out — as confidence 0, not as a
+    wrong number.
+  * Large per-step ROTATION is worse: over a 360 deg spin (22 deg per step)
+    accumulated yaw came out ~3x low. Small per-tick rotations are fine.
+  * Featureless ground gives nothing, and drift accumulates — which is why
+    Breadcrumbs is bounded in distance and time rather than kept as a map.
 
-  * Stationary is clean. On six real frames 1.5 s apart the total drift was
-    0.01 cm and 0.0 deg at confidence 1.00 over ~750 tracks, and identical
-    frames give exactly zero. No phantom motion.
-  * Per-frame motion above ~0.1 m loses tracking, because the near-field ground
-    under a 148 mm camera changes scale drastically between frames. At 5 Hz and
-    0.3 m/s a tick is 0.06 m, which is comfortable -- but the measured loop runs
-    nearer 1.5 Hz, where the same speed gives 0.2 m and VO will start dropping
-    out. That shows up as confidence 0, not as a wrong number.
-  * Large per-step ROTATION is worse than translation: over the 360 deg spin
-    (up to 22 deg per step) accumulated yaw came out ~3x low. Small per-tick
-    rotations in the control loop are fine.
-  * Featureless ground gives nothing at all.
-  * Drift accumulates, which is why Breadcrumbs is bounded in both distance and
-    time rather than kept as a map.
-
-Every estimate carries a confidence and callers are expected to stop trusting
-it rather than assume it is always right. A confidently wrong displacement
-would poison both the pose buffer and the retreat path.
+Every estimate carries a confidence; callers are expected to stop trusting it
+rather than assume it is always right.
 """
 from __future__ import annotations
 
@@ -114,10 +85,10 @@ class VisualOdometry:
         max_step_m: float = 1.0,
     ):
         """
-        max_range_m: ground points further than this are dropped. Far points sit
-            near the horizon where a single pixel spans a huge distance, so they
-            dominate the fit while carrying the least information.
-        horizon_margin_px: stay well clear of the horizon for the same reason.
+        max_range_m: drop ground points further than this. Near the horizon a
+            single pixel spans a huge distance, so far points dominate the fit
+            while carrying the least information.
+        horizon_margin_px: stay clear of the horizon, for the same reason.
         max_step_m: a single-frame jump larger than this is a tracking failure,
             not motion. At ~1.5 Hz and 0.3 m/s the true step is ~0.2 m.
         """
@@ -182,8 +153,8 @@ class VisualOdometry:
         R, t = _kabsch_2d(P, Q)
         resid = float(np.median(np.linalg.norm((P @ R.T + t) - Q, axis=1)))
 
-        # Re-fit on inliers: a few bad tracks (a moving shadow, a pedestrian's
-        # foot) otherwise drag the whole rigid fit.
+        # Re-fit on inliers: a moving shadow or a pedestrian's foot otherwise
+        # drags the whole rigid fit.
         err = np.linalg.norm((P @ R.T + t) - Q, axis=1)
         keep = err <= max(2.0 * resid, 0.01)
         if int(keep.sum()) >= self.min_tracks:
@@ -211,15 +182,14 @@ class Breadcrumbs:
     """
     Short memory of where the rover has just been, in the CURRENT robot frame.
 
-    The point is escape. With no rear camera, reversing is blind, and a blind
-    15-tick reverse drove this rover into a staircase. Ground the rover has
-    already driven over is the best evidence available that a retreat is
-    clear -- not proof, since the world moves, but far better than nothing.
+    The point is escape. With no rear camera, reversing is blind — a blind
+    15-tick reverse drove this rover into a staircase — and ground already
+    driven over is the best evidence a retreat is clear.
 
-    Every stored point is transported into the current frame on each update, so
-    a caller can read them directly as "where I came from, from here". Bounded
-    in both distance and time because visual odometry drifts and because stale
-    evidence about a dynamic scene is not evidence.
+    Points are transported into the current frame on every update, so a caller
+    reads them directly as "where I came from, from here". Bounded in distance
+    and time because VO drifts and stale evidence about a dynamic scene is not
+    evidence.
     """
 
     def __init__(self, max_points: int = 60, max_distance_m: float = 4.0,
@@ -267,8 +237,8 @@ class Breadcrumbs:
     def retreat_path(self, max_m: float = 1.5) -> Optional[np.ndarray]:
         """
         Recently-driven ground, nearest first, as an (N,2) robot-frame path to
-        follow backwards. None when there is not enough trail to be useful --
-        in which case the caller must NOT invent one.
+        follow backwards. None when the trail is too short to be useful — in
+        which case the caller must NOT invent one.
         """
         if len(self.pts) < 3:
             return None
@@ -279,16 +249,39 @@ class Breadcrumbs:
         pts = pts[d <= max_m]
         return pts if len(pts) >= 3 else None
 
-    def retreat_bearing(self, max_m: float = 1.5) -> Optional[float]:
+    def extent_m(self) -> float:
         """
-        Direction the rover came from, left-positive.
+        How far the trail reaches — net displacement, not path length.
 
-        With no rear camera the better escape is often to TURN toward this
-        bearing and drive forward with the camera looking where it is going,
-        rather than to back along it blind.
+        `travelled_m` sums |delta| per tick and so counts noise and skid: a rover
+        yawing in place accumulated 4.0 m of "travel" and 37 crumbs without
+        leaving a 1 m circle.
+        """
+        if not self.pts:
+            return 0.0
+        return float(max(np.hypot(x, y) for x, y, _ in self.pts))
+
+    def retreat_bearing(
+        self, max_m: float = 1.5, min_extent_m: float = 0.4
+    ) -> Optional[float]:
+        """
+        Direction the rover came from, left-positive. None when unknowable.
+
+        With no rear camera the better escape is usually to TURN toward this and
+        drive forward, camera looking where it is going, rather than back along
+        it blind.
+
+        `min_extent_m` is load-bearing, not a tuning knob: under an in-place
+        pivot odometry still reports 4-8 cm of skid per tick at high confidence,
+        so crumbs accumulate and their centroid points in a RANDOM direction.
+        That produced eight consecutive escapes at +116, +113, +134, +130, -160,
+        +112, -165 and +101 degrees while the rover stayed put. A trail with no
+        extent does not know where we came from and must say so.
         """
         p = self.retreat_path(max_m)
         if p is None:
+            return None
+        if self.extent_m() < min_extent_m:
             return None
         v = p.mean(axis=0)
         if float(np.hypot(*v)) < 1e-3:

@@ -121,6 +121,49 @@ class TestVetoLogic(unittest.TestCase):
         self.assertFalse(bool(keep[0]), "robot-left path crosses bad surface")
         self.assertTrue(bool(keep[1]), "robot-right path should survive")
 
+    def test_segformer_source_treats_a_verge_as_drivable(self):
+        """
+        `SegFormerSource.traversable` documents that soft surface is "costed by
+        costmap.offtrack_cost, NOT vetoed here" — and then returned a mask that
+        excluded it, so every candidate crossing a verge was vetoed.
+
+        Harmless beside a dirt track, fatal on a grass site: measured live at
+        sem(hard=0.00 off=0.88 track=0.01), the veto reported all_untraversable
+        12/12 on ground with zero hazard and the rover sat down.
+        """
+        from erc_urban.modules.traversability import SegFormerSource
+
+        class GrassSemantics:
+            ready = True
+
+            def labels(self, rgb, out_hw):
+                return np.full(out_hw, 2, np.int16)
+
+            def categorize(self, labels):
+                z = np.zeros_like(labels, bool)
+                return z, np.ones_like(labels, bool), z    # all soft
+
+        src = SegFormerSource(semantics=GrassSemantics())
+        trav = src.traversable(np.zeros((10, 10, 3), np.uint8), (8, 8))
+        self.assertTrue(trav.all(), "a grass field must be drivable")
+
+    def test_segformer_source_still_excludes_hazards(self):
+        """The loosening must not reach `hard` — people, cars, water, stairs."""
+        from erc_urban.modules.traversability import SegFormerSource
+
+        class HazardSemantics:
+            ready = True
+
+            def labels(self, rgb, out_hw):
+                return np.full(out_hw, 1, np.int16)
+
+            def categorize(self, labels):
+                o = np.ones_like(labels, bool)
+                return o, o, o          # hard AND soft AND good
+        src = SegFormerSource(semantics=HazardSemantics())
+        trav = src.traversable(np.zeros((10, 10, 3), np.uint8), (8, 8))
+        self.assertFalse(trav.any(), "hard hazards must still be excluded")
+
     def test_source_unavailable_fails_open(self):
         """No evidence is not a veto — the geometric costmap still applies.
         Failing closed here would strand the rover whenever the segmenter

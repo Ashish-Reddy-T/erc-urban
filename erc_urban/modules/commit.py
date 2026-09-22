@@ -1,29 +1,11 @@
 """
-Module 5b — the commit window (replacing plan.md's RTC leg).
+The commit window: hold the chosen path for a bounded window, advancing it by
+visual odometry and blending at the seam when a new plan arrives.
 
-WHY NOT RTC
------------
-plan.md's M5 calls for Real-Time Chunking to cover base-policy inference lag.
-RTC (arXiv 2506.07339) freezes the prefix of an action CHUNK and inpaints the
-remainder with a flow/diffusion model. LogoNav is a single-shot regressor at
-~13 ms on mps -- there is no chunk and no denoiser, so there is nothing for RTC
-to operate on. Adopting it would be cargo-culting the name.
-
-The problem RTC solves is real, though, and we do have it: the loop was
-measured near 1.5 Hz, not the nominal 5 Hz, and telemetry is ~1.3 s stale. If
-the rover simply re-plans from scratch each tick, the commanded path jumps
-whenever perception flickers, and between plans it has nothing to follow.
-
-WHAT THIS DOES INSTEAD
-----------------------
-Hold the chosen path for a bounded window, advancing along it using visual
-odometry, and blend at the seam when a new plan arrives. Same goal as RTC --
-continuous motion, no discontinuity at the hand-over -- without pretending a
-regressor has chunks.
-
-Committing is also what makes the plan robust to a single bad tick. A one-frame
-segmentation glitch should not be able to swing the command; it should have to
-persist long enough to earn the next plan.
+The loop runs near 1.5 Hz, not the nominal 5 Hz, and telemetry is ~1.3 s stale.
+Re-planning from scratch every tick makes the command jump whenever perception
+flickers, and leaves nothing to follow between plans. Committing also means a
+one-frame segmentation glitch cannot swing the command.
 """
 from __future__ import annotations
 

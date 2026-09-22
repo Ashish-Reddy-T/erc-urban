@@ -1,10 +1,8 @@
 """
-Depth-based obstacle gate — colleague ERC-3 / Depth Anything V2.
+Depth-based obstacle gate, wrapping ERC-3's Depth Anything V2 stack.
 
-Official FrodoBots SDK exposes only RGB + GPS (+ lamp). There is no LiDAR /
-ultrasonic. Real obstacle clearance in the outdoor stack is monocular metric
-depth (Depth Anything V2) → polar bins → stop/turn, same as
-ERC-3 outdoor_traversability + depth_estimator.
+The SDK exposes only RGB + GPS + lamp — no LiDAR, no ultrasonic — so clearance
+is monocular metric depth -> polar bins -> stop/turn.
 """
 from __future__ import annotations
 
@@ -46,30 +44,23 @@ class DepthObstacleGate:
         self.obstacle_m = obstacle_m
         self.every_n = max(1, every_n)
         self.device = device
-        # 'indoor' (hypersim, max_depth 20) not 'outdoor' (vkitti, max_depth 80).
-        # Measured on the live Mini+: the vkitti checkpoint's whole-frame minimum
-        # is 5.36 m and ground directly under a 148 mm camera reads 5.62 m --
-        # its output range IS the vkitti range, because vkitti is a car-mounted
-        # driving set and this camera is 10x lower. With clearance never below
-        # ~5.4 m, stop_m=0.55 and COSTMAP_STOP_M=1.2 could never fire: the
-        # geometric safety layer was silently dead. hypersim gives 1.14-19.61 m
-        # on the same frame. Residual scale error is handled by DepthResponseFit.
+        # 'indoor' (hypersim) not 'outdoor' (vkitti). Measured: the vkitti
+        # checkpoint bottoms out at 5.36 m on this camera because vkitti is a
+        # car-mounted set and this lens is 10x lower, so no stop threshold could
+        # ever fire. hypersim gives 1.14-19.61 m on the same frame; residual
+        # scale error is handled by DepthResponseFit.
         self.checkpoint_domain = checkpoint_domain
         self._estimator = None
         self._trav = None
         self._tick = 0
         self._last: Optional[DepthClearance] = None
-        # Most recent metric depth map, exposed so the costmap can reuse it
-        # instead of running Depth Anything a second time per tick. This is the
-        # CORRECTED map when a response fit is attached.
+        # Corrected depth, exposed so the costmap reuses it rather than running
+        # Depth Anything twice per tick.
         self.last_depth = None
-        # Uncorrected map, kept so the response fit can be re-observed against
-        # it. Fitting on already-corrected depth would compound the correction.
+        # Uncorrected: fitting on already-corrected depth would compound.
         self.last_raw_depth = None
-        # Optional DepthResponseFit (modules/depth_scale.py). Applied inside
-        # evaluate() so this gate's own stop distance and the costmap's shared
-        # copy are corrected identically -- two consumers disagreeing about
-        # scale is how a "safe" clearance becomes a collision report.
+        # Applied inside evaluate() so this gate's stop distance and the
+        # costmap's shared copy are corrected identically.
         self.response_fit = None
         self._load_error: Optional[str] = None
         self._try_load()
@@ -97,8 +88,7 @@ class DepthObstacleGate:
                     checkpoint_domain=self.checkpoint_domain,
                 )
             except Exception as e:
-                # Never lose the obstacle gate over an accelerator quirk —
-                # a slow gate beats no gate.
+                # A slow gate beats no gate.
                 if dev in (None, "cpu"):
                     raise
                 print(f"[DepthObstacleGate] {dev} failed ({e}) — retrying on cpu")
@@ -134,11 +124,10 @@ class DepthObstacleGate:
             return self._last
 
         try:
-            # 16:9 to match the 1024x576 frame. The old (120, 160) is 4:3, so it
-            # squashed the frame vertically by 1.33x -- and both DepthCostmap
-            # and ERC-3 backproject assuming SQUARE pixels (fy = fx). Every
-            # height and range computed from that map was therefore wrong,
-            # manufacturing obstacles out of flat ground.
+            # 16:9 to match the 1024x576 frame. A 4:3 target squashes it by
+            # 1.33x, and both backprojections assume square pixels — every
+            # height and range would be wrong, inventing obstacles from flat
+            # ground.
             depth = self._estimator.estimate(front, target_size=(144, 256))
             self.last_raw_depth = depth
             if self.response_fit is not None and self.response_fit.ready:

@@ -1,42 +1,27 @@
 """
-Camera calibration — the shared geometry behind M4 and M6.
+Camera calibration — the shared geometry for anything that turns robot-frame
+metres into pixels and back (the overlay renderer, the vetoes, odometry).
 
-Two things need to turn robot-frame metres into image pixels and back:
-
-  * M4's overlay renderer, which draws the K candidate paths onto the frame as
-    numbered polylines for the VLM to choose between. Slow-Brain's ablation
-    shows the VLM picks well only when it can see where each path actually
-    goes; a mis-projected overlay is worse than none, because the VLM answers
-    confidently about the wrong geometry.
-  * M6's SAM-TP veto, which needs a 3x3 K and a 4x4 pose to project a
-    traversability mask into the ground plane (GENIE-SAMTP's documented input).
-
-Neither existed, so both lived on guesses. `costmap.py` assumes a 90 deg
-horizontal FOV with square pixels, and ERC-3's `depth_estimator.py:241` makes
-exactly the same assumption. That guess is not crazy, but nobody has checked it:
-FrodoBots publishes no intrinsics for the Mini+, and the front lens looks wide
-enough that a pinhole model may not hold at the edges.
-
-So this module makes the guess EXPLICIT and replaceable, rather than scattered
-across three files as a magic 90.0. Every instance carries `source`, which says
-where its numbers came from — an assumed FOV, a checkerboard, or a ground-plane
-self-calibration. Anything that projects geometry should be willing to say how
-much it trusts the projection.
+FrodoBots publishes no intrinsics, so this was scattered across three files as a
+magic 90 deg FOV. Here it is explicit and replaceable, and every instance
+carries `source` saying where its numbers came from: an assumed FOV, a
+checkerboard, or a ground-plane self-calibration. Anything that projects
+geometry should be willing to say how much it trusts the projection.
 
 FRAMES
 ------
 Robot:  x forward, y left, z up. Matches Candidate.waypoints.
-Camera: X right, Y down, Z forward (optical axis). Matches costmap.py:26.
+Camera: X right, Y down, Z forward (optical axis).
 
-The camera sits `height_m` above the ground plane and is pitched down by
-`pitch_rad`. Level camera first, then a rotation about the camera's X axis:
+The camera sits `height_m` above the ground and is pitched down by `pitch_rad`.
+Level camera first, then a rotation about the camera's X axis:
 
     X =  Xl
     Y =  Yl*cos(t) - Zl*sin(t)
     Z =  Yl*sin(t) + Zl*cos(t)
 
-A downward pitch moves distant ground points UP the image, which is the sign
-convention that trips people up, so it is pinned by a test.
+A downward pitch moves distant ground points UP the image — the sign convention
+that trips people up, so it is pinned by a test.
 """
 from __future__ import annotations
 
@@ -48,11 +33,9 @@ from typing import Optional
 
 import numpy as np
 
-# Same value ERC-3 and costmap.py already assume, kept so this module changes
-# nothing until someone measures the real number.
+# Fallbacks only. camera_front.json carries the measured values (fx 340,
+# ~113 deg, height 0.148 m); these apply when it is missing.
 DEFAULT_FOV_DEG = 90.0
-# Mini+ is a small 4-wheel sidewalk rover; the front camera sits low on the
-# body. Only used to seed self-calibration, which then overwrites it.
 DEFAULT_HEIGHT_M = 0.14
 
 
@@ -68,8 +51,7 @@ class CameraCalibration:
     cy: float
     height_m: float = DEFAULT_HEIGHT_M
     pitch_rad: float = 0.0
-    # Provenance. Never let a projection be trusted more than its source
-    # deserves: "assumed_fov" means nobody measured this.
+    # Provenance: "assumed_fov" means nobody measured this.
     source: str = "assumed_fov"
     notes: str = ""
 
@@ -84,13 +66,7 @@ class CameraCalibration:
         pitch_rad: float = 0.0,
         source: str = "assumed_fov",
     ) -> "CameraCalibration":
-        """
-        The fallback everything currently uses: square pixels, centred
-        principal point, focal length implied by a guessed FOV.
-
-        Identical arithmetic to costmap.py:92 and ERC-3 depth_estimator.py:270,
-        so adopting this class changes no existing behaviour.
-        """
+        """Fallback: square pixels, centred principal point, FOV-implied fx."""
         fx = width / (2.0 * math.tan(math.radians(fov_horizontal_deg) / 2.0))
         return cls(
             width=width, height=height,
@@ -112,12 +88,10 @@ class CameraCalibration:
 
     def scaled_to(self, width: int, height: int) -> "CameraCalibration":
         """
-        Rescale for a resized frame.
+        Rescale for a resized frame — depth, semantics and the raw frame all run
+        at different sizes, and a projection computed at one is wrong at another.
 
-        Needed constantly: depth runs at 160x120, semantics at 512x512, the raw
-        frame is something else again, and a projection computed at one size is
-        wrong at another. Assumes a plain resize (no crop) — which is what
-        `SemanticTraversability.labels` does, per its docstring.
+        Assumes a plain resize with no crop, which is what the segmenter does.
         """
         sx, sy = width / self.width, height / self.height
         return CameraCalibration(
@@ -130,7 +104,7 @@ class CameraCalibration:
 
     # ---- matrices -------------------------------------------------------
     def K(self) -> np.ndarray:
-        """3x3 intrinsics, the form SAM-TP and OpenCV expect."""
+        """3x3 intrinsics, in the form OpenCV and SAM-TP expect."""
         return np.array(
             [[self.fx, 0.0, self.cx],
              [0.0, self.fy, self.cy],
@@ -139,10 +113,8 @@ class CameraCalibration:
 
     def T_robot_to_cam(self) -> np.ndarray:
         """
-        4x4 robot->camera transform, the other half of SAM-TP's input.
-
-        Rotation composes the axis relabel (robot x-fwd/y-left/z-up to camera
-        X-right/Y-down/Z-fwd) with the downward pitch.
+        4x4 robot->camera transform: the axis relabel (robot x-fwd/y-left/z-up
+        to camera X-right/Y-down/Z-fwd) composed with the downward pitch.
         """
         t = self.pitch_rad
         c, s = math.cos(t), math.sin(t)
@@ -168,9 +140,9 @@ class CameraCalibration:
         """
         (N,3) robot-frame points -> ((N,2) pixels, (N,) bool in-front mask).
 
-        The mask matters: points behind the camera project to plausible-looking
-        pixels with a sign flip, so drawing without it puts a candidate that
-        goes backwards cleanly in the middle of the image.
+        The mask matters: points behind the camera project to plausible pixels
+        with a sign flip, so drawing without it puts a backwards-going candidate
+        cleanly in the middle of the image.
         """
         p = np.atleast_2d(np.asarray(pts_robot, dtype=np.float64))
         x, y, z = p[:, 0], p[:, 1], p[:, 2]
@@ -194,14 +166,11 @@ class CameraCalibration:
 
     def image_to_ground(self, uv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
-        Pixels -> robot-frame ground points, by intersecting the pixel ray with
-        z = 0. The inverse-perspective step M6 needs to turn a traversability
-        mask into a BEV costmap.
+        Pixels -> robot-frame ground points, intersecting the pixel ray with z=0.
 
         Returns (xy, valid). Rays at or above the horizon never meet the ground
-        and come back invalid rather than as a huge bogus distance — the mistake
-        that puts a phantom drivable surface at 400 m and lets the rover drive
-        at a wall.
+        and come back INVALID rather than as a huge bogus distance — which would
+        put a phantom drivable surface at 400 m and drive the rover at a wall.
         """
         p = np.atleast_2d(np.asarray(uv, dtype=np.float64))
         X = (p[:, 0] - self.cx) / self.fx
@@ -221,12 +190,10 @@ class CameraCalibration:
 
     def horizon_v(self) -> float:
         """
-        Image row of the horizon. Everything above it is sky or vertical
-        structure, never ground.
+        Image row of the horizon; above it is never ground.
 
         As a ground point recedes, Y -> -D*sin(t) and Z -> D*cos(t), so
-        v -> cy - fy*tan(t). Note the MINUS: pitching down moves the horizon UP
-        the image, matching `test_downward_pitch_raises_distant_ground`.
+        v -> cy - fy*tan(t). Note the MINUS: pitching down raises the horizon.
         """
         return self.cy - self.fy * math.tan(self.pitch_rad)
 
@@ -256,20 +223,14 @@ def extrinsics_from_ground_plane(
     normal_cam: np.ndarray, offset_d: float
 ) -> tuple[float, float]:
     """
-    Recover (height_m, pitch_rad) from a fitted ground plane.
+    Recover (height_m, pitch_rad) from a fitted ground plane — a free extrinsic
+    calibration, since `DepthCostmap._fit_ground` RANSACs one every tick.
 
-    `DepthCostmap._fit_ground` already RANSACs this plane every tick and throws
-    the pose information away. That is a free extrinsic calibration: a camera
-    looking at a flat surface tells you exactly how high and how tilted it is,
-    with no checkerboard and no rover in hand.
-
-    Takes the plane in the SAME convention `_fit_ground` returns: `normal_cam`
-    a unit normal oriented up (camera frame, Y down), `offset_d` such that a
-    point's height above ground is `n . p - d`.
-
-    For a level camera the up-normal is (0, -1, 0); pitching down by t rotates
-    it to (0, -cos t, -sin t), which inverts to the atan2 below. The camera is
-    at the origin, so its own height above the plane is -d.
+    Same convention `_fit_ground` returns: `normal_cam` a unit normal oriented
+    up (camera frame, Y down), `offset_d` such that height above ground is
+    `n . p - d`. For a level camera the up-normal is (0, -1, 0); pitching down
+    by t rotates it to (0, -cos t, -sin t). The camera is at the origin, so its
+    own height above the plane is -d.
     """
     n = np.asarray(normal_cam, dtype=np.float64).ravel()
     n = n / max(float(np.linalg.norm(n)), 1e-9)

@@ -1,6 +1,4 @@
 """
-Thin client for the FrodoBots earth-rovers-sdk local FastAPI server (v6.x).
-
 From docs:
   - Server: `hypercorn main:app --reload` (default http://localhost:8000)
   - POST /control          {"command": {"linear", "angular"}}  (lamp optional)
@@ -13,8 +11,6 @@ From docs:
     - POST /checkpoint-reached
     - POST /end-mission
   - GET  /status           pipeline health
-
-Everything downstream talks ONLY to this class.
 """
 from __future__ import annotations
 import base64
@@ -105,11 +101,6 @@ class RoverClient:
 
     # ---- telemetry ---------------------------------------------------------
     def get_data(self) -> Telemetry:
-        """
-        Parse /data. Official keys are latitude/longitude/orientation (degrees).
-        Extra aliases kept for older payloads. Full payload kept in .raw
-        (battery, mags, gyros, accels, rpms, ...).
-        """
         stamp = time.monotonic()
         try:
             r = requests.get(f"{self.base}/data", timeout=self.timeout)
@@ -122,16 +113,10 @@ class RoverClient:
         if not isinstance(d, dict):
             return Telemetry(np.nan, np.nan, None, stamp, {})
 
-        def pick(*keys):
-            for k in keys:
-                if k in d and d[k] is not None:
-                    return d[k]
-            return None
+        lat = d.get("latitude")
+        lon = d.get("longitude")
+        yaw_deg = d.get("orientation")
 
-        lat = pick("latitude", "lat", "gps_lat")
-        lon = pick("longitude", "lon", "gps_lon")
-        # Official field is orientation in degrees (Santiago + SDK examples).
-        yaw_deg = pick("orientation", "yaw", "heading")
         yaw = math.radians(float(yaw_deg)) if yaw_deg is not None else None
 
         def _last_ts(key):
@@ -145,6 +130,7 @@ class RoverClient:
 
         hw_ts = _last_ts("gyros") or _last_ts("accels")
         age = (time.time() - hw_ts) if hw_ts is not None else None
+        
         yaw_rate = None
         gy = d.get("gyros")
         if isinstance(gy, list) and gy and isinstance(gy[-1], list) and len(gy[-1]) >= 3:
@@ -152,6 +138,7 @@ class RoverClient:
                 yaw_rate = float(gy[-1][2])
             except (TypeError, ValueError):
                 yaw_rate = None
+
         wheels = None
         rp = d.get("rpms")
         if isinstance(rp, list) and rp and isinstance(rp[-1], list):
@@ -173,7 +160,6 @@ class RoverClient:
         )
 
     def get_status(self) -> Optional[dict]:
-        """GET /status if this SDK build has it (v6+). Older builds return None."""
         r = requests.get(f"{self.base}/status", timeout=self.timeout)
         if r.status_code == 404:
             return None
@@ -181,17 +167,17 @@ class RoverClient:
         return r.json()
 
     def ping(self) -> bool:
-        """True if something is listening on the SDK base URL."""
+        """True if something is listening on http://localhost:8000."""
         try:
             r = requests.get(self.base, timeout=self.timeout)
-            # 200 dashboard, or 400 "Call /start-mission..." both mean server is up.
+            # 200 dashboard, or 400 "Call /start-mission..."
             return r.status_code < 500
         except Exception:
             return False
 
     # ---- missions ----------------------------------------------------------
     def list_missions(self) -> list[dict]:
-        """GET /missions when available; [] if endpoint missing (older SDK)."""
+        """GET /missions when available"""
         r = requests.get(f"{self.base}/missions", timeout=self.timeout)
         if r.status_code == 404:
             return []
@@ -199,7 +185,7 @@ class RoverClient:
         return r.json().get("missions", [])
 
     def start_mission(self) -> dict:
-        """POST /start-mission — requires MISSION_SLUG set in the SDK .env."""
+        """POST /start-mission"""
         r = requests.post(f"{self.base}/start-mission", timeout=self.timeout)
         try:
             body = r.json()
@@ -211,7 +197,7 @@ class RoverClient:
         return body
 
     def end_mission(self) -> dict:
-        """POST /end-mission — emergency only; drops mission progress."""
+        """POST /end-mission."""
         r = requests.post(
             f"{self.base}/end-mission", 
             timeout=self.timeout
@@ -220,53 +206,37 @@ class RoverClient:
         return r.json()
 
     def get_checkpoints(self) -> tuple[list[Checkpoint], int]:
-        """
-        GET /checkpoints-list.
-        Returns (checkpoints sorted by sequence, latest_scanned_checkpoint).
-        """
+        """GET /checkpoints-list"""
         r = requests.get(f"{self.base}/checkpoints-list", timeout=self.timeout)
         r.raise_for_status()
         d = r.json()
-        # SDK may return the Frodo payload directly, or nested once.
-        if isinstance(d, dict) and "checkpoints_list" in d:
-            raw_list = d.get("checkpoints_list") or []
-            latest = int(d.get("latest_scanned_checkpoint", 0) or 0)
-            if isinstance(raw_list, dict):
-                latest = int(raw_list.get("latest_scanned_checkpoint", latest) or 0)
-                raw_list = raw_list.get("checkpoints_list", [])
-        elif isinstance(d, list):
-            raw_list, latest = d, 0
-        else:
-            raw_list, latest = [], 0
+        raw_list = d.get("checkpoints_list") or []
+        latest = d.get("latest_scanned_checkpoint") or 0
+
         cps: list[Checkpoint] = []
         for c in raw_list:
             cps.append(
                 Checkpoint(
-                    id=int(c["id"]) if c.get("id") is not None else None,
-                    sequence=int(c.get("sequence", len(cps) + 1)),
-                    lat=float(c.get("latitude", c.get("lat"))),
-                    lon=float(c.get("longitude", c.get("lon"))),
+                    id=c.get("id"),
+                    sequence=c.get("sequence"),
+                    lat=float(c.get("latitude")),
+                    lon=float(c.get("longitude")),
                 )
             )
-        cps.sort(key=lambda c: c.sequence)
+        cps.sort(key=lambda c: c.sequence) # Ascending for sanity-check
         return cps, latest
 
     def checkpoint_reached(self) -> dict:
-        """
-        POST /checkpoint-reached — server validates ~15 m proximity.
-        On success: {"message": ..., "next_checkpoint_sequence": N}
-        On failure (HTTP 400): detail includes proximate_distance_to_checkpoint.
-        """
+        """POST /checkpoint-reached."""
         r = requests.post(
             f"{self.base}/checkpoint-reached",
             json={},
             timeout=self.timeout,
         )
-        # Don't raise — caller often wants the 400 distance payload.
         try:
             body = r.json()
         except Exception:
             body = {"detail": r.text}
-        if r.status_code >= 400:
+        if r.status_code >= 400: # When outside the 15m proximity radius
             body.setdefault("_http_status", r.status_code)
         return body

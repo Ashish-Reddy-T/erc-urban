@@ -1,8 +1,9 @@
 """
-Classical path perception for Stage 0/1 (no ML).
+Classical path perception for Stage 0/1 (no ML). Only reachable under
+USE_DIRT_GATE=1.
 
-Treats brown dirt *and* gray asphalt as traversable; green grass is the hard
-veto. Brightness floors adapt to scene mean so night roads are not falsely
+Brown dirt and grey asphalt are traversable; green grass is the hard veto.
+Brightness floors adapt to the scene mean so night roads are not falsely
 blocked when dirt_frac looks low.
 """
 from __future__ import annotations
@@ -109,10 +110,7 @@ def rescore(cands: list[Candidate], path: PathView, goal_w: float = 0.6,
 
 
 class DirtPathGate:
-    """
-    Hard veto grass; require some traversable hits unless night/uncertain,
-    where we only reject arcs that land on grass.
-    """
+    """Hard veto on grass; at night, veto grass only."""
 
     def __init__(
         self,
@@ -174,7 +172,7 @@ class DirtPathGate:
 
 
 def _traversable_mask(rgb: np.ndarray, mean_b: float | None = None) -> np.ndarray:
-    """Brown soil + gray asphalt/road. Floors scale with scene brightness."""
+    """Brown soil + grey asphalt. Floors scale with scene brightness."""
     r = rgb[:, :, 0].astype(np.float32)
     g = rgb[:, :, 1].astype(np.float32)
     b = rgb[:, :, 2].astype(np.float32)

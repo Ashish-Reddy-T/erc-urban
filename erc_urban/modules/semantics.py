@@ -1,26 +1,17 @@
 """
-Semantic traversability (Module 6, semantic half).
+Semantic traversability — the surface judgement geometry cannot make.
 
-Geometry answers "is there a thing in my way". It cannot answer "is this
-surface the path" — a dirt track and the flat grass verge beside it are
-geometrically identical, and so are a puddle and solid ground. plan.md flags
-exactly this via Sorokin: grass-vs-pavement confusion is the dominant
-sidewalk-violation failure mode.
-
-SegFormer-B2 fine-tuned on ADE20K gives LABELLED classes (road, path, dirt
-track, earth, grass, person, car, water), which is what the veto actually
-needs. GeNIE uses SAM2, but SAM2's masks are class-agnostic — they segment
-regions without naming them, so they still need a heuristic to decide which
-region is drivable. Named classes skip that step.
+A dirt track and the flat grass verge beside it are geometrically identical, and
+so are a puddle and solid ground. SegFormer-B2 on ADE20K gives NAMED classes
+(road, path, earth, grass, person, car, water), which is what the veto needs;
+class-agnostic masks would still need a heuristic to say which region is
+drivable.
 
 Three categories:
-  HARD   — never drive here, whatever the geometry says. Dynamic actors
-           (person, car, animal) and negative obstacles geometry cannot see:
-           water, pools, stairwells. A puddle is a flat ground plane.
-  SOFT   — drivable but off-track (grass, plants). Penalised, not vetoed,
-           so the rover prefers the trail but can leave it to get around
-           something.
-  GOOD   — the track itself. Used to confirm the path, never to force it.
+  HARD  — never drive here, whatever the geometry says: dynamic actors, and the
+          negative obstacles geometry cannot see (water, pools, stairwells).
+  SOFT  — drivable but off-track (grass, plants). Penalised, never vetoed.
+  GOOD  — the track itself. Confirms the path, never forces it.
 """
 from __future__ import annotations
 
@@ -75,10 +66,9 @@ class SemanticTraversability:
         min_blob_frac: float = 0.004,
     ):
         self.size = size
-        # A HARD class can stop the mission, so it must clear two bars:
-        # confident per-pixel, and part of a region big enough to be real.
-        # Sunlit or wet dirt reads as "water" to ADE20K models, and a handful
-        # of stray pixels must never be able to halt the rover.
+        # A HARD class can stop the mission, so it clears two bars: confident
+        # per-pixel, and part of a region big enough to be real. Sunlit or wet
+        # dirt reads as "water" to ADE20K models.
         self.conf = conf
         self.min_blob_frac = min_blob_frac
         self.ready = False
@@ -165,12 +155,10 @@ class SemanticTraversability:
         soft = np.isin(labels, list(self.soft)) if self.soft else np.zeros_like(labels, bool)
         good = np.isin(labels, list(self.good)) if self.good else np.zeros_like(labels, bool)
         hard = self._filter_hard(hard)
-        # Traversable BY EXCLUSION, not by allow-list. A gravel track segments
-        # as "rock", a leaf-littered one as any of a dozen classes; enumerating
-        # every surface ADE20K might pick is hopeless and fails closed, which
-        # means refusing to drive on a perfectly good path. Vegetation and
-        # hazards are the small, well-defined sets — everything else at ground
-        # level is drivable.
+        # Traversable BY EXCLUSION, not allow-list. A gravel track segments as
+        # "rock", a leaf-littered one as any of a dozen classes; enumerating
+        # them fails closed, i.e. refuses to drive on a good path. Vegetation
+        # and hazards are the small well-defined sets.
         notground = (
             np.isin(labels, list(self.notground))
             if self.notground else np.zeros_like(labels, bool)
@@ -184,15 +172,12 @@ class SemanticTraversability:
         """
         Where is the path, and how much of it can we see?
 
-        Returns (fraction_of_frame, fraction_of_lower_band, bearing_rad).
-        Bearing is left-positive, from the horizontal centroid of traversable
-        pixels in the lower band of the image — the near-field, which is what
-        the rover is about to drive over. None when nothing is traversable.
+        Returns (fraction_of_frame, fraction_of_lower_band, bearing_rad), the
+        bearing left-positive from the centroid of traversable pixels in the
+        near-field band. None when nothing is traversable.
 
-        This is the signal that actually matters on a single-track dirt path:
-        follow the line, even when the line does not point at the GPS goal.
-        Monocular depth cannot see a grass wall, but semantics can see that
-        the track has run out.
+        Monocular depth cannot see a grass wall — it reported 2.4 m with blades
+        against the lens — but this can see the track has run out.
         """
         h, w = good.shape
         band = good[int(h * (1.0 - lower_frac)):, :]
@@ -219,15 +204,13 @@ class SemanticTraversability:
         col_thresh: float = 0.5,
     ) -> tuple[Optional[float], float]:
         """
-        Widest continuous drivable corridor in the near field.
+        Widest continuous drivable corridor in the near field, as
+        (bearing_rad_left_positive, width_as_fraction_of_frame).
 
-        Returns (bearing_rad_left_positive, width_as_fraction_of_frame).
-
-        A centroid is the wrong statistic for a single-track path: grass on
-        both sides with a gap in the middle averages to the middle, but so
-        does grass in the middle with gaps on both sides. The widest
-        contiguous run is what the rover can actually fit through, and its
-        width is a direct measure of confidence.
+        A centroid is the wrong statistic here: grass both sides with a gap in
+        the middle averages to the middle, but so does grass in the middle with
+        gaps both sides. The widest contiguous run is what the rover fits
+        through, and its width measures confidence directly.
         """
         h, w = good.shape
         band = good[int(h * (1.0 - lower_frac)):, :]

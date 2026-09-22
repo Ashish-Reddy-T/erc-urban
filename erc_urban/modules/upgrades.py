@@ -1,12 +1,9 @@
 """
-UPGRADE MODULES. Each class honors an interface from interfaces.py so it
-drops into the Stage-0 loop with a one-line swap. Where a class wraps an
-external repo whose exact API I cannot verify from here, the integration
-point is marked `# >>> WIRE:` — that is the ONE line you edit after cloning
-the repo. I refuse to invent function signatures around those points; a
-wrong guess there costs you more than the stub saves.
+STAGE 2/3 modules. Not on the default STAGE=1 path.
 
-Provenance per module is in each docstring.
+VLMSelectorFusion here is superseded by modules/selector.py, whose fusion algebra
+is the same but whose overlay actually renders and whose similarity has progress
+alignment. Unwired integration points are marked UNWIRED.
 """
 from __future__ import annotations
 import time
@@ -15,20 +12,11 @@ import numpy as np
 from ..interfaces import Candidate, Observation
 
 
-# =====================================================================
-# M1 UPGRADE — learned multi-hypothesis planner (MBRA/LogoNav or NoMaD)
-#   repo: general-navigation-models (ViNT/NoMaD)  https://github.com/robodhruv/visualnav-transformer
-#   repo: MBRA/LogoNav (Berkeley)  — checkpoints via the paper's project page
-#   Why: native to FrodoBots-2K/7K (MBRA-labeled) and emits the K-candidate
-#   set the whole downstream stack needs. This is the KEYSTONE risk: verify
-#   you can get calibrated multi-hypothesis output before building M4/M5.
-# =====================================================================
+# ---- STAGE 3 planner ---------------------------------------------------
 class LearnedPlanner:
     """
-    M1 upgrade stub. Prefer STAGE=1 LogoNavPlanner (erc_urban.modules.logonav)
-    which wraps the colleague ERC-3 outdoor LogoNav weights.
-
-    For STAGE=3 / custom CKPT, set CKPT=... and wire sample() below.
+    Stage-3 stub for a custom checkpoint. Delegates to LogoNavPlanner when CKPT
+    points at logonav.pth, and raises otherwise — prefer STAGE=1.
     """
     def __init__(self, checkpoint_path: str, device: str = "cuda",
                  horizon_m: float = 3.0, n_pts: int = 8):
@@ -59,18 +47,7 @@ class LearnedPlanner:
         )
 
 
-# =====================================================================
-# M4 + M5(slow) — VLM candidate selector + latency-resilient fusion
-#   paper: Slow Brain, Fast Planner (arXiv 2606.20458)
-#   Why: closes the trajectory-scoring gap at junctions/pedestrians and is
-#   TRAINING-FREE. Uses their two verified tricks:
-#     (a) render K candidates as numbered overlays, VLM picks an index;
-#     (b) Probability Fusion with exponential staleness decay so a 1-3s
-#         stale pick still drives a 5-20Hz loop.
-#   Their ablations, baked in as defaults below: hide goal+scores from the
-#   VLM; K in [12,18]; Gemini-2.5-Flash-Lite for latency; Probability (not
-#   Score) Fusion for stability.
-# =====================================================================
+# ---- STAGE 3 selector (superseded by modules/selector.py) --------------
 class VLMSelectorFusion:
     def __init__(self, k: int = 18, tau_decay_s: float = 5.0, lam: float = 1.0,
                  query_hz: float = 1.0, vlm_call=None):
@@ -78,9 +55,8 @@ class VLMSelectorFusion:
         self.tau = tau_decay_s
         self.lam = lam
         self.query_dt = 1.0 / query_hz
-        # >>> WIRE: vlm_call(image_with_overlay_np, k) -> int index.
-        # Wrap your VLM API (Gemini/GPT/Qwen) here. Prompt: hide goal &
-        # planner scores; ask only which numbered path is best & safe.
+        # UNWIRED: vlm_call(overlay_np, k) -> int index. Hide the goal and the
+        # planner scores from the prompt, or the VLM defers to the ranking.
         self.vlm_call = vlm_call
         self._last = {"idx": None, "waypoints": None, "stamp": -1e9}
         self._lock = threading.Lock()
@@ -114,9 +90,7 @@ class VLMSelectorFusion:
 
         dt = obs.stamp - last["stamp"]
         w = np.exp(-dt / self.tau)  # exponential staleness decay
-        # motion-compensate omitted for brevity: compare in current frame via
-        # horizon-truncated similarity (paper Eq.1). Odometry compensation
-        # plugs in at PoseBuffer (M5 transport) below.
+        # No motion compensation here; selector.py's `_similarity` has it.
         planner_scores = np.array([c.score for c in cands], float)
         sims = -np.array([_traj_dist(c.waypoints, last["waypoints"])
                           for c in cands])
@@ -128,24 +102,16 @@ class VLMSelectorFusion:
         return int(np.argmax(fused))
 
 
-# =====================================================================
-# M5(transport) — SE(2) pose-buffer realignment (AsyncShield)
-#   Why: de-stales the CHOSEN waypoint for the 4G round-trip using the
-#   odometry delta between capture and now. Needs only IMU/odom (which we
-#   have) — no onboard compute, which we don't.
-# =====================================================================
+# ---- SE(2) pose-buffer realignment -------------------------------------
 class PoseBuffer:
     """
-    AsyncShield's temporal pose buffer: turn "instruction lag" into a
-    deterministic "spatial offset" via an SE(2) transform.
+    Turn instruction lag into a deterministic spatial offset via an SE(2)
+    transform, de-staling the chosen waypoint for the round-trip.
 
-    Feed it with `integrate()` from visual odometry. run.py used to call
-    `push(stamp, 0.0, 0.0, yaw)` with x and y HARDCODED TO ZERO, so the
-    translation term was identically zero and `realign` did nothing but rotate
-    -- the module appeared wired while performing half its job. The odometry
-    the plan assumed (wheel RPM, yaw rate) does not exist on this rover: `rpms`
-    reads [0,0,0,0] permanently and the compass suffers magnetometer
-    interference. modules/odometry.py supplies the real thing.
+    Feed it with `integrate()` from visual odometry. The odometry this was
+    designed around does not exist on this rover — `rpms` reads [0,0,0,0]
+    permanently and the compass suffers magnetometer interference — so
+    modules/odometry.py supplies the real thing.
     """
 
     def __init__(self, maxlen: int = 256):
@@ -162,14 +128,14 @@ class PoseBuffer:
         """
         Accumulate one OdomDelta into an odom-frame pose and record it.
 
-        The delta is expressed in the robot frame at the START of the step, so
-        it must be rotated into the odom frame before accumulating -- adding it
-        directly would make every turn corrupt the track.
+        The delta is in the robot frame at the START of the step, so it must be
+        rotated into the odom frame before accumulating -- adding it directly
+        would make every turn corrupt the track.
         """
         if delta is None or delta.confidence <= 0.0:
-            # Still record the timestamp: a gap with no motion estimate is
-            # better represented as "no movement observed" than as a hole,
-            # which `_nearest` would silently bridge with a stale pose.
+            # Still record the timestamp: a gap is better represented as "no
+            # movement observed" than as a hole `_nearest` would bridge with a
+            # stale pose.
             self.push(stamp, self.x, self.y, self.yaw)
             return
         c, s = np.cos(self.yaw), np.sin(self.yaw)
@@ -198,29 +164,6 @@ class PoseBuffer:
         return min(self.buf, key=lambda p: abs(p[0] - t))
 
 
-# =====================================================================
-# M6 — traversability veto (GeNIE-style SAM2 costmap)
-#   repo: SAM2 (facebookresearch/sam2). GeNIE fuses a generalizable
-#   traversability head; here we expose the veto interface. Marked stub
-#   because the segmentation->costmap->robot-frame projection depends on
-#   your camera intrinsics/extrinsics, which I can't guess.
-# =====================================================================
-class TraversabilityGate:
-    def __init__(self, sam2_predictor=None, intrinsics=None, extrinsics=None):
-        # >>> WIRE: load SAM2 predictor + your camera calibration.
-        self.seg = sam2_predictor
-        self.K = intrinsics
-        self.T = extrinsics
-
-    def mask(self, obs: Observation, cands) -> np.ndarray:
-        if self.seg is None:
-            return np.ones(len(cands), dtype=bool)  # no-op until wired
-        # >>> WIRE: segment walkable surface on obs.front, project each
-        # candidate's waypoints to image, mark False if any point lands on
-        # non-traversable (road/grass/obstacle). Return boolean mask.
-        raise NotImplementedError
-
-
 # ---------------- small helpers ----------------
 def _softmax(x):
     x = x - x.max()
@@ -235,6 +178,5 @@ def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 def _render_overlay(front, cands):
-    # Minimal overlay so the WIRE point has something to pass. Replace with a
-    # proper camera-projected polyline renderer once intrinsics are known.
+    # Placeholder. selector.render_overlay is the real projected renderer.
     return front

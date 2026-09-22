@@ -1,37 +1,24 @@
 """
 Convert a FrodoBots ride into the episode format `eval.record` produces, so the
-existing benchmarks run on it unchanged.
+benchmarks run on it unchanged.
 
     python -m erc_urban.eval.frodobots --ride <dir> --out runs/vn1 --hz 5
 
-WHY THIS EXISTS
----------------
-Our own recordings are confounded as reference data. An episode driven by a
-FIXED command is an arc the rover drove because it was told to, not because the
-scene called for it, so scoring a perception-driven planner against it punishes
-the planner for correctly going straight and rewards any selector with a
-matching turn bias. Measured on such an episode, a uniformly RANDOM candidate
-beat the planner by 35% -- which says nothing about the planner.
+Our own recordings are confounded as reference data: an episode driven by a
+FIXED command is an arc the rover drove because it was told to, so scoring a
+perception-driven planner against it punishes the planner for correctly going
+straight. On such an episode a uniformly RANDOM candidate beat the planner by
+35%, which says nothing about the planner.
 
-FrodoBots rides are HUMAN TELEOPERATION. The path taken reflects a person
-reacting to the scene, which is the reference an imitation-style metric actually
-needs. It also removes the need to drive our own rover to produce test data.
+These rides are HUMAN TELEOPERATION, so the path reflects a person reacting to
+the scene — the reference an imitation-style metric needs. The front camera is
+1024x576, identical to ours, so the measured intrinsics transfer directly, and
+rides span many countries.
 
-Two further reasons this is the right corpus:
-  * the front camera is 1024x576, identical to our Mini+, so the measured
-    intrinsics (fx 340, ~113 deg) transfer directly rather than being re-guessed.
-  * rides span many countries, which is the "works anywhere, not just one site"
-    axis the whole project is aimed at.
-
-REFERENCE TRAJECTORY
---------------------
-Visual odometry again, not GPS. The rides carry GPS at 1 Hz, but consumer GPS
-error is metres while the candidates we score span ~2.5 m, so GPS is far too
-coarse for short-horizon ADE. VO is centimetre-accurate per tick. What changed
-versus our own recordings is not the odometry, it is who was steering.
-
-The rides DO carry real wheel RPMs, which our rover reports as a constant
-[0,0,0,0]. `--check-rpm` uses them as an independent sanity check on VO.
+The reference trajectory is VO, not the rides' 1 Hz GPS: consumer GPS error is
+metres while the candidates we score span ~2.5 m. The rides do carry real wheel
+RPMs, which our rover reports as a constant [0,0,0,0]; `--check-rpm` uses them
+as an independent sanity check on VO.
 """
 from __future__ import annotations
 

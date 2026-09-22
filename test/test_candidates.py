@@ -184,14 +184,13 @@ class TestPropose(unittest.TestCase):
         )
         self.assertEqual(len(p.propose(_obs(), k=18)), 1)
 
-    def test_anchor_horizon_tracks_policy_horizon(self):
-        """LogoNav shortens its path when blocked (2.69 m open vs 0.69 m facing
-        an obstacle). Anchors must shorten with it, or every anchor looks
-        equally unlike the prior and the prior term stops discriminating."""
+    def test_anchor_horizon_sees_past_the_bumper(self):
+        """LogoNav is 0.7-2.7 m. Overlay / veto / VLM need longer arcs so
+        they are not all dying in the near-field roots."""
         p = MultiHypothesisPlanner(base=FakeBase(), n_perturbed=1, n_anchors=12)
         prior = np.stack([np.linspace(0, 0.8, 8), np.zeros(8)], axis=1)
         lens = [float(np.linalg.norm(a[-1])) for a in p._anchor_paths(_obs(), prior)]
-        self.assertLess(max(lens), 1.5)
+        self.assertGreater(min(lens), 8.0)
 
 
 class TestFallback(unittest.TestCase):

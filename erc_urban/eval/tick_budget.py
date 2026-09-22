@@ -1,18 +1,15 @@
 """
 Per-module tick cost. `python -m erc_urban.eval.tick_budget`
 
-plan.md calls this non-negotiable: a module that blows the budget is a module
-that does not ship. It matters more on this rover than the plan assumed,
-because of a measured hardware fact -- the Mini+ has a command watchdog, so a
-single /control POST produces +0.7 deg of yaw while the same command streamed
-at 5 Hz produces +18.6 deg. Command RATE is effective speed. A slow tick does
-not merely delay decisions, it physically slows the robot down.
+The rover has a command watchdog: a single /control POST produces +0.7 deg of
+yaw where the same command streamed at 5 Hz produces +18.6 deg. Command RATE is
+effective speed, so a slow tick does not merely delay decisions, it physically
+slows the robot down.
 
-The SDK itself is not the constraint: /control 4 ms, /v2/screenshot 21 ms,
-/data 3 ms, so ~28 ms (35 Hz) is achievable before any inference. Everything
-below that line is ours.
+The SDK is not the constraint — /control 4 ms, /v2/screenshot 21 ms, /data 3 ms,
+so ~28 ms is achievable before any inference. Everything above that is ours.
 
-Runs on recorded frames by default so it is reproducible and needs no rover.
+Runs on recorded frames, so it is reproducible and needs no rover.
 """
 from __future__ import annotations
 

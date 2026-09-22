@@ -1,19 +1,19 @@
 """
 Per-term scoring diagnostic. `python -m erc_urban.eval.score_diag --ep runs/vn1`
 
-The selector benchmark says the ranking is worse than random. That is a verdict,
-not a diagnosis. This asks which TERM is responsible, by correlating each term
-against the thing we actually want (low ADE to what a human drove).
+"The ranking is worse than random" is a verdict, not a diagnosis. This asks
+which TERM is responsible, correlating each against what we want: low ADE to
+what a human drove.
 
-Spearman rank correlation, per term, over all candidates at each tick:
+Spearman per term, over all candidates at each tick:
 
     positive  the term ranks good candidates higher -- it is helping
     ~zero     the term carries no information about this choice
-    negative  the term systematically prefers candidates the human avoided,
-              and its weight should be reduced or its sign is wrong
+    negative  the term prefers candidates the human avoided, so its weight
+              should drop or its sign is wrong
 
-Rank correlation rather than Pearson because only the ORDER matters: the
-argmax is what gets driven, not the score's magnitude.
+Rank correlation rather than Pearson because only the ORDER matters: the argmax
+is what gets driven, not the score's magnitude.
 """
 from __future__ import annotations
 

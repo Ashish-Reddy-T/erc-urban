@@ -1,50 +1,21 @@
-
 """
-Module 2 — route/GPS conditioning by visual alignment.
+Route/GPS conditioning by visual alignment: fuse the GPS goal bearing with the
+corridor the camera can see, in one place instead of three ad-hoc blends.
 
-plan.md: take UrbanVLA's route-visual alignment (arXiv 2510.23576) — align the
-noisy GPS/route waypoints against what the camera actually sees instead of
-treating GPS as a hard target. Feed the checkpoint as a soft directional prior
-fused with vision; never servo to a raw fix.
+This matters more here than it should. Measured on the live Mini+, lat/lon came
+back bit-identical across 24 stationary samples AND across 30 s of commanded
+driving. A controller that servos to that is servoing to a constant, so vision
+is the only live signal.
 
-WHY THIS MATTERS MORE HERE THAN THE PAPER SUGGESTS
---------------------------------------------------
-The urban track's 15 m tolerance exists because consumer GPS in a street canyon
-is bad. On this rover it is worse than "noisy": measured on the live Mini+,
-`latitude`/`longitude` came back BIT-IDENTICAL across 24 stationary samples and
-again across 30 s of commanded driving, while the IMU updated normally. Whatever
-the cause, a controller that servos to that number is servoing to a constant.
-Vision is the signal that is actually live.
-
-So the fusion here is not a refinement, it is the difference between a rover
-that follows the visible path and one that grinds toward a stale fix.
-
-WHAT THIS REPLACES
-------------------
-run.py currently blends GPS against vision at three separate sites with three
-different rules:
-
-  * `TRACK_BLEND` (run.py:971)      - lerp bearing toward the track centroid
-  * `CORRIDOR_GOAL_BIAS` (run.py:980) - corridor overrides, goal biases within it
-  * `_steer_nudge` (run.py:231)     - proportional yaw-rate correction
-
-Each was tuned against a different failure and they interact in ways nobody can
-hold in their head. This consolidates the *policy* into one tested object; the
-callers keep their own gains.
-
-THE POLICY
-----------
-Trust vision in proportion to how much of it there is:
+The policy — trust vision in proportion to how much of it there is:
 
   * A wide, confident corridor is the constraint, not a hint. On a single-track
-    path the line IS the way through, and it may point away from the goal for a
-    while. Follow it, and let the goal bias the aim point WITHIN it.
-  * A weak or absent corridor means we have no visual opinion, so fall back to
-    the GPS bearing.
+    path the line IS the way through and may point away from the goal for a
+    while; the goal only biases the aim point WITHIN it.
+  * A weak or absent corridor means no visual opinion: fall back to GPS.
   * The goal's influence is a BOUNDED offset, never a fraction of the bearing.
-    Blending 20% of a -134 deg goal parks the aim 27 deg off the corridor centre
-    -- i.e. outside the corridor, which is how the rover loses the path. This is
-    the bug run.py:984 already documents; here it is enforced by construction.
+    Blending 20% of a -134 deg goal parks the aim 27 deg off the corridor
+    centre, i.e. outside it, which is how the rover loses the path.
   * Turn around for the goal only when it is genuinely behind us.
 """
 from __future__ import annotations
@@ -76,9 +47,9 @@ class RouteAim:
 
 class RouteAligner:
     """
-    M2: fuse the GPS goal bearing with the visually-observed corridor.
+    Fuse the GPS goal bearing with the visually-observed corridor.
 
-    Stateless per tick and free of any rover I/O, so it is testable without
+    Stateless per tick and free of rover I/O, so it is testable without
     hardware and cannot surprise the control loop.
     """
 
@@ -86,9 +57,11 @@ class RouteAligner:
         self,
         corridor_min_width: float = 0.12,
         corridor_full_width: float = 0.45,
+        corridor_open_width: float = 0.97,
         goal_bias_max_deg: float = 8.0,
         goal_bias_gain: float = 0.20,
         track_min_frac: float = 0.04,
+        track_sat_frac: float = 0.97,
         turnaround_deg: float = 120.0,
         narrow_speed_scale: float = 0.7,
     ):
@@ -99,24 +72,64 @@ class RouteAligner:
             would make the rover twitch as a corridor comes and goes.
         goal_bias_max_deg: hard cap on how far the goal may pull the aim off the
             corridor centre. This is the load-bearing bound described above.
+        track_sat_frac: at or above this near-band traversable fraction the
+            track centroid carries NO directional information and must not
+            steer. `semantics.track` returns the horizontal centroid of
+            traversable pixels; when the whole band is traversable that
+            centroid is the middle of the frame by construction, i.e. "straight
+            ahead", whatever is actually out there. Measured live on grass:
+            near=1.00 with the reported bearing pinned at exactly +0 degrees on
+            every tick while the goal sat 90 degrees off the bow. Treating that
+            as a visual opinion suppressed the align pivot and the rover drove
+            straight past the checkpoint.
         turnaround_deg: only above this goal error do we abandon the corridor and
             pivot. Below it, the path is still the way to the goal even if it
             currently points elsewhere.
         """
         self.corridor_min_width = corridor_min_width
         self.corridor_full_width = max(corridor_full_width, corridor_min_width + 1e-6)
+        self.corridor_open_width = max(corridor_open_width,
+                                       self.corridor_full_width + 1e-6)
         self.goal_bias_max = np.radians(goal_bias_max_deg)
         self.goal_bias_gain = goal_bias_gain
         self.track_min_frac = track_min_frac
+        self.track_sat_frac = track_sat_frac
         self.turnaround_deg = turnaround_deg
         self.narrow_speed_scale = narrow_speed_scale
 
     def confidence(self, corridor_width: float) -> float:
-        """How much to trust vision, ramped over the corridor width."""
+        """
+        How much to trust vision, as a function of corridor width.
+
+        Rises over [corridor_min_width, corridor_full_width] — a corridor has to
+        be wide enough to be real before it constrains anything — and drops to
+        ZERO at `corridor_open_width`, because a corridor that spans essentially
+        the whole frame is not a corridor at all.
+
+        That last step is deliberate rather than a ramp, because the property it
+        stands for is binary: a corridor is defined by its EDGES. `corridor()`
+        returns the longest run of drivable columns over the frame width, so a
+        value at 1.0 means no column anywhere was closed — there is no edge, and
+        therefore nothing to follow. A width of 0.85 has 15% of columns closed;
+        that is a real, wide corridor and it keeps full confidence.
+
+        Why it matters, measured live on grass: every column read open, width
+        came back 1.00, this returned 1.00, and the corridor policy then let the
+        goal move the aim by at most `goal_bias_max_deg`. Logged as
+        src=corridor(1.00@+8deg) with the goal at +90deg and cmd ang=0.02 —
+        about 2 deg/s against a 90 degree error. The rover drove a straight line
+        past the checkpoint, range 24.4 m -> 30.5 m, every gate reporting clear.
+
+        At confidence 0 the caller falls back to `_aligning()`, which pivots to
+        face the goal and then drives: the right move on an open field.
+        """
         if corridor_width <= self.corridor_min_width:
             return 0.0
+        if corridor_width >= self.corridor_open_width:
+            return 0.0
         span = self.corridor_full_width - self.corridor_min_width
-        return float(np.clip((corridor_width - self.corridor_min_width) / span, 0.0, 1.0))
+        return float(np.clip(
+            (corridor_width - self.corridor_min_width) / span, 0.0, 1.0))
 
     def align(
         self,
@@ -139,14 +152,10 @@ class RouteAligner:
         """
         goal_err_deg = abs(np.degrees(goal_bearing))
 
-        # The goal is genuinely behind us: no corridor is worth following
-        # backwards. Pivot, and let the caller's align logic take over.
-        #
-        # Gated on `goal_trusted` because a turnaround driven by a bad bearing
-        # is the worst possible failure: observed live with frozen GPS and a
-        # drifting compass, the bearing sat at +-177 deg and the SIGN flipped
-        # between ticks, so the rover reversed its pivot direction every burst
-        # and span in place indefinitely without ever driving.
+        # Goal genuinely behind us: no corridor is worth following backwards.
+        # Gated on `goal_trusted` — with frozen GPS and a drifting compass the
+        # bearing sat at +-177 deg with the SIGN flipping between ticks, so the
+        # rover reversed its pivot every burst and span in place forever.
         if goal_trusted and goal_err_deg > self.turnaround_deg:
             return RouteAim(bearing=_wrap(goal_bearing), confidence=0.0,
                             source="turnaround", speed_scale=0.0,
@@ -162,7 +171,12 @@ class RouteAligner:
             return RouteAim(bearing=_wrap(corridor_bearing), confidence=conf,
                             source="corridor(no-gps)", speed_scale=speed,
                             corridor_width=corridor_width)
-        if not goal_trusted and track_bearing is not None and (track_frac or 0) >= self.track_min_frac:
+        track_usable = (
+            track_bearing is not None
+            and (track_frac or 0.0) >= self.track_min_frac
+            and (track_frac or 0.0) < self.track_sat_frac
+        )
+        if not goal_trusted and track_usable:
             return RouteAim(bearing=_wrap(track_bearing), confidence=0.5,
                             source="track(no-gps)", corridor_width=corridor_width)
 
@@ -180,15 +194,10 @@ class RouteAligner:
             return RouteAim(bearing=aim, confidence=conf, source="corridor",
                             speed_scale=speed, corridor_width=corridor_width)
 
-        # No corridor, but traversable surface is visible: use its centroid as a
-        # weak visual prior. Weaker than a corridor because a centroid cannot
-        # tell "gap in the middle" from "grass in the middle" -- the reason
-        # semantics.corridor() exists at all.
-        if (
-            track_bearing is not None
-            and track_frac is not None
-            and track_frac >= self.track_min_frac
-        ):
+        # No corridor, but traversable surface is visible: its centroid is a
+        # weak prior. Weaker because a centroid cannot tell "gap in the middle"
+        # from "grass in the middle" -- why semantics.corridor() exists.
+        if track_usable:
             w = 0.5
             return RouteAim(bearing=_wrap((1.0 - w) * goal_bearing + w * track_bearing),
                             confidence=w, source="track",

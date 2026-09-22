@@ -1,25 +1,21 @@
 """
 Selector benchmark. `python -m erc_urban.eval.selector_bench --ep runs/ep1`
 
-Answers the question the oracle gap raises but cannot settle: the gap says a
-perfect selector could cut ADE by 56-71%, but is OUR selector -- Gemini looking
-at a rendered overlay -- actually better than the planner's own ranking, or just
-different from it?
-
-Live testing showed Gemini disagreeing with the planner (picking +6, +53, +65
-deg where the planner wanted 0 deg) and, worryingly, disagreeing with ITSELF
-across identical queries. Disagreement is not improvement. This measures which.
+The oracle gap says a perfect selector could cut ADE by 56-71%. This answers
+what it cannot: is OUR selector better than the planner's ranking, or merely
+different from it? Live testing showed Gemini disagreeing with the planner —
+and, worryingly, with ITSELF across identical queries. Disagreement is not
+improvement.
 
 Reports, per tick:
     planner   ADE of the candidate the planner ranks first
     vlm       ADE of the candidate the VLM picks
     fused     ADE after Probability Fusion (what actually drives)
     oracle    ADE of the best candidate available
-    random    ADE of a uniformly random candidate -- the floor a "selector"
-              must beat to be doing anything at all
+    random    ADE of a uniformly random candidate
 
-The random baseline matters. A selector that merely perturbs the choice will
-land between planner and random; only a real one beats the planner.
+The random baseline is the one that matters: a selector that merely perturbs the
+choice lands between planner and random, and only a real one beats the planner.
 
 Costs one VLM call per evaluated tick (~$0.0004 each on Flash-Lite).
 """

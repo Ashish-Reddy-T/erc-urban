@@ -4,36 +4,25 @@ Record a driving episode for offline benchmarking.
     python -m erc_urban.eval.record --out runs/ep1 --seconds 60
 
 Saves frames plus, per tick, the visual-odometry delta and the command issued.
-The VO track is what makes the recording useful: GPS on this rover is frozen
-(bit-identical across 30 s of driving), so the only available ground truth for
-"where did the rover actually go" is the one we compute ourselves.
+The VO track is what makes the recording useful: GPS here is frozen, so the only
+ground truth for "where did the rover actually go" is the one we compute.
 
-Commands are STREAMED at `--hz`, not sent once. The Mini+ has a command
-watchdog: a single POST yields +0.7 deg of yaw where the same command at 5 Hz
-yields +18.6 deg. A recorder that sends once records a stationary robot.
+Commands are STREAMED at `--hz`, not sent once — the command watchdog means a
+recorder that sends once records a stationary robot.
 
-SAFETY -- READ THIS BEFORE CHANGING ANYTHING BELOW
---------------------------------------------------
-An earlier version of this file streamed a fixed command open-loop with NO
-perception in the loop at all, and put the rover on its side. The failure is
-worth stating exactly, because the information needed to prevent it was already
-being recorded:
+SAFETY — READ BEFORE CHANGING ANYTHING BELOW
+--------------------------------------------
+An earlier version streamed a fixed command open-loop with NO perception at all
+and put the rover on its side. Everything needed to prevent it was already being
+recorded: over the final 8 seconds of commanded 0.32 forward, VO measured 19 cm
+of travel at confidence 0.94-0.98 (a real measurement of a jammed rover, not a
+dropout) while the frames went almost entirely to sky.
 
-  * over the final 40 ticks -- 8 seconds of commanded 0.32 forward -- visual
-    odometry measured 19 cm of travel, 0.3-0.8 cm per tick, at confidence
-    0.94-0.98. High confidence means that was a real measurement of a jammed
-    rover, not a tracking dropout.
-  * the frames at that point were almost entirely sky: the rover had climbed a
-    planter and pitched up.
-  * the recorder kept commanding forward regardless, and it went over.
-
-The whole stack has layers that catch all of this -- TRACK_MIN, the costmap
-stop, the semantic veto, the IMU tilt -- and this file used none of them.
-A benchmark harness that drives must not be less careful than the thing it is
-benchmarking. Three independent guards now run every tick, any of which halts:
+A benchmark harness that drives must not be less careful than the thing it
+benchmarks. Three independent guards now halt the run:
 
   1. IMU tilt        -- the rover is going over
-  2. VO stall        -- commanded to move, measurably not moving = jammed
+  2. VO stall        -- commanded to move, measurably not moving
   3. traversability  -- no drivable surface in the near field
 
 Use --unsafe only for a rover on blocks.

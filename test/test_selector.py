@@ -15,6 +15,7 @@ from erc_urban.calib import CameraCalibration
 from erc_urban.interfaces import Candidate, Observation
 from erc_urban.modules.selector import (
     PROMPT, VLMSelector, _similarity, _softmax, render_overlay,
+    dump_candidates,
 )
 
 try:
@@ -92,6 +93,20 @@ class TestOverlay(unittest.TestCase):
         cal = _cal()
         base = _obs(cal=cal).front
         np.testing.assert_array_equal(render_overlay(base, [], cal), base)
+
+    def test_dump_writes_overlay_and_waypoints(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        cal = _cal()
+        with tempfile.TemporaryDirectory() as d:
+            dump_candidates(d, _obs(cal=cal).front, _cands(3), cal, chosen_idx=1)
+            self.assertTrue((Path(d) / "latest.jpg").is_file())
+            payload = json.loads((Path(d) / "latest.json").read_text())
+            self.assertEqual(payload["chosen"], 1)
+            self.assertEqual(payload["n"], 3)
+            self.assertGreater(len(payload["paths"][0]["xy"]), 2)
 
 
 class TestSimilarity(unittest.TestCase):
@@ -306,6 +321,24 @@ class TestDecisionGating(unittest.TestCase):
         want, why = s.is_decision_point(tied, corridor_width=0.9)
         self.assertTrue(want)
         self.assertIn("contested", why)
+
+    def test_tied_scores_on_the_same_heading_are_not_contested(self):
+        """Score margin alone is not a decision if every arc goes the same way."""
+        s = self._sel()
+        scores = [-0.50, -0.51, -1.0, -1.5, -2.0]
+        same = [Candidate(c.waypoints, score=sc, stamp=1.0)
+                for c, sc in zip(_cands(5, span=0.05), scores)]
+        want, why = s.is_decision_point(same, corridor_width=0.9)
+        self.assertFalse(want)
+        self.assertEqual(why, "routine")
+
+    def test_tiny_hard_frac_is_not_a_hazard(self):
+        """Park log: gate=hazard(0.01) on dirt. That is noise, not a person."""
+        s = self._sel()
+        want, why = s.is_decision_point(_cands(5), hazard_frac=0.01,
+                                        corridor_width=0.9)
+        self.assertFalse(want)
+        self.assertEqual(why, "routine")
 
     def test_gating_actually_suppresses_the_call(self):
         calls = []

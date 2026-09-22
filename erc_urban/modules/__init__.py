@@ -1,1 +1,1 @@
-# Stage-0 classical modules (dirt_path, baseline) and later ML stubs (upgrades).
+# Perception, planning and control modules. See run.py for how they compose.

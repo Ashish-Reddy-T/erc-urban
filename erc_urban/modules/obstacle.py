@@ -1,13 +1,7 @@
 """
-Fast contact / occlusion checks from RGB (no LiDAR on FrodoBots).
-
-Depth Anything often lies at true contact (~3 m on a wall). This module
-catches "front filled / rear open" and works with GPS-freeze reverse in run.py.
-
-Signals:
-  - open: peripheral far lights in the upper band (not the center lamp hotspot)
-  - contact: lamp hotspot + low peripheral far lights
-  - rear clearer than front → reverse
+Fast RGB contact checks. There is no LiDAR on FrodoBots, and Depth Anything
+often reads ~3 m at true contact against a wall, so this is the near-field
+backstop: lamp hotspot with dark periphery means something is against the nose.
 """
 from __future__ import annotations
 from dataclasses import dataclass
