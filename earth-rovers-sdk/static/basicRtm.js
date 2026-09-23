@@ -11,11 +11,45 @@ $(document).ready(function () {
   // Create an instance of an RTM channel
   const rtmChannel = rtmClient.createChannel(channelName);
 
-  // Event listener for connection state changes
-  rtmClient.on("ConnectionStateChange", (newState, reason) => {
+  // Event listener for connection state changes.
+  // The RTM session carries BOTH telemetry (MessageFromPeer -> window.rtm_data)
+  // and control (sendMessageToPeer). If it drops, /data silently serves the
+  // last message forever and /control goes nowhere, while video keeps playing.
+  // So: expose the state, and log back in automatically after a drop.
+  window.rtm_state = "INIT";
+  window.rtm_reason = "";
+  window.rtm_dead = false;
+  let relogging = false;
+  // NB: Agora RTM 1.x emits "ConnectionStateChanged"; the SDK originally
+  // listened for "ConnectionStateChange", which never fires. Listen to both.
+  const onRtmState = (newState, reason) => {
     console.log(
       "on connection state changed to " + newState + " reason: " + reason
     );
+    window.rtm_state = newState;
+    window.rtm_reason = reason;
+    window.rtm_state_t = Date.now() / 1000;
+    if (newState === "ABORTED" || newState === "DISCONNECTED") {
+      window.rtm_dead = true;
+      if (!relogging) {
+        relogging = true;
+        setTimeout(() => {
+          rtmClient.logout().catch(() => {}).finally(() => {
+            joinRTMChannel(USER_ID);
+            relogging = false;
+          });
+        }, 2000);
+      }
+    }
+    if (newState === "CONNECTED") {
+      window.rtm_dead = false;
+    }
+  };
+  rtmClient.on("ConnectionStateChanged", onRtmState);
+  rtmClient.on("ConnectionStateChange", onRtmState);
+  rtmClient.on("TokenExpired", () => {
+    window.rtm_state = "TOKEN_EXPIRED";
+    window.rtm_dead = true;
   });
 
   // Event listener for receiving a channel message
@@ -25,9 +59,20 @@ $(document).ready(function () {
 
   rtmClient.on("MessageFromPeer", function (message, peerId) {
     const controls = JSON.parse(new TextDecoder().decode(message.rawMessage));
+    // Only the bot we command may populate rtm_data. 2026-09-22: two rovers
+    // (signatures e538dd66.. and 473ca229..) were publishing into this
+    // session and /data alternated between them (battery 29 / 80), mixing
+    // their wheel and IMU streams.
+    window.rtm_peers = window.rtm_peers || {};
+    window.rtm_peers[String(peerId)] = (Date.now() / 1000);
+    if (String(peerId) !== String(botUid)) {
+      window.rtm_other = controls;
+      return;
+    }
     const event = new CustomEvent("message-from-peer", { detail: controls });
     window.rtm_data = controls;
     window.rtm_data.timestamp = (Date.now() / 1000).toFixed(6);
+    window.rtm_data.peer = String(peerId);
     const formattedMessage = formatMessage(controls);
     $("#messages").html(formattedMessage);
     document.dispatchEvent(event);

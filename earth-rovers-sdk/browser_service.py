@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from pyppeteer import launch
@@ -21,9 +22,22 @@ class BrowserService:
     def __init__(self):
         self.browser = None
         self.page = None
+        # One launch at a time: /data, /v2/front and /control arrive
+        # concurrently, and without this each launched its own headless Chrome
+        # (three per recovery in the 2026-09-22 log) and they raced to
+        # net::ERR_ABORTED.
+        self._init_lock = asyncio.Lock()
         self.default_viewport = {"width": 3840, "height": 2160}
 
     async def initialize_browser(self):
+        if self.browser:
+            return
+        async with self._init_lock:
+            if self.browser:
+                return
+            await self._initialize_browser_locked()
+
+    async def _initialize_browser_locked(self):
         if not self.browser:
             try:
                 executable_path = os.getenv(
@@ -131,6 +145,14 @@ class BrowserService:
             )
 
         return bot_data
+
+    async def rtm_status(self) -> dict:
+        """RTM connection state as seen by the page (see static/basicRtm.js)."""
+        await self.initialize_browser()
+        return await self.page.evaluate(
+            """() => ({state: window.rtm_state || null, reason: window.rtm_reason || null,
+                      dead: !!window.rtm_dead})"""
+        )
 
     async def front(self) -> str:
         await self.initialize_browser()

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/ERC-3-earthrover-challenge" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/AsyncVLA" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/GENIE-SAMTP" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/Learning-to-Drive-Anywhere-with-MBRA" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/OmniVLA" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/S2E" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/UrbanVLA" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/metaurban" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/sam2" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/urban-sim" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/repos/visualnav-transformer" vcs="Git" />
+  </component>
+</project>

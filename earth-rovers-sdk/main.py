@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import os
+import time
 from datetime import datetime
 import asyncio
 
@@ -475,10 +476,64 @@ async def get_screenshot(view_types: str = "rear,map,front"):
     return JSONResponse(content=response_content)
 
 
+# ---- stale-RTM recovery -------------------------------------------------------
+# Observed 2026-09-22: three times in one evening /data froze (payload
+# timestamp minutes old) and /control stopped moving the bot, while video kept
+# streaming — the page's RTM session had dropped and nothing re-joined it.
+# Detect it here and rebuild the headless session; if a plain rejoin does not
+# help, fetch fresh tokens too.
+RTM_STALE_S = float(os.getenv("RTM_STALE_S", "6"))
+RTM_REINIT_COOLDOWN_S = float(os.getenv("RTM_REINIT_COOLDOWN_S", "15"))
+_rtm_last_reinit = 0.0
+_rtm_reinits = 0
+_rtm_last_kick = 0.0
+
+
+async def _rtm_recover(reason: str) -> None:
+    global _rtm_last_reinit, _rtm_reinits, auth_response_data
+    now = time.time()
+    if now - _rtm_last_reinit < RTM_REINIT_COOLDOWN_S:
+        return
+    _rtm_last_reinit = now
+    _rtm_reinits += 1
+    logger.warning("RTM stale (%s) — rebuilding headless session (#%d)", reason, _rtm_reinits)
+    try:
+        await browser_service.close_browser()
+    except Exception:
+        pass
+    if _rtm_reinits % 2 == 0 and not get_env_tokens():
+        # a plain rejoin did not help last time: refresh the tokens as well
+        try:
+            auth_response_data = None
+            await auth_common()
+            logger.warning("RTM recovery: fetched fresh tokens")
+        except Exception as e:
+            logger.error("RTM recovery: token refresh failed: %s", e)
+
+
 @app.get("/data")
 async def get_data():
     await need_start_mission()
     data = await browser_service.data()
+    try:
+        ts = float((data or {}).get("timestamp", 0) or 0)
+        status = await browser_service.rtm_status()
+    except Exception:
+        ts, status = 0.0, {}
+    age = time.time() - ts if ts else None
+    if isinstance(data, dict):
+        data["rtm_state"] = status.get("state")
+        data["rtm_reason"] = status.get("reason")
+        data["rtm_age_s"] = round(age, 2) if age is not None else None
+    if status.get("dead"):
+        # the page re-logs in by itself (static/basicRtm.js); just record it
+        global _rtm_last_kick
+        if time.time() - _rtm_last_kick > 5:
+            _rtm_last_kick = time.time()
+            logger.warning("RTM session dropped: state=%s reason=%s (page is re-logging in)",
+                           status.get("state"), status.get("reason"))
+    if age is not None and age > RTM_STALE_S:
+        await _rtm_recover(f"state={status.get('state')} reason={status.get('reason')} age={age:.1f}")
     # Headless RTM often returns null after restart while the dashboard tab
     # still shows "Message from Peer". Rejoin once and retry.
     if data is None:

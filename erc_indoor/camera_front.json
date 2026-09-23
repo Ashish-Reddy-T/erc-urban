@@ -1,0 +1,12 @@
+{
+  "width": 1024,
+  "height": 576,
+  "fx": 340.0,
+  "fy": 340.0,
+  "cx": 512.0,
+  "cy": 288.0,
+  "height_m": 0.148,
+  "pitch_rad": -0.041153222641442964,
+  "source": "spin360_loop_closure + indoor_floor_horizon",
+  "notes": "fx/FOV measured on the live Mini+ by closing a 360 deg in-place spin (48 frames, 226-inlier loop closure); fx=330-350px -> ~113 deg, vs the 90 deg previously assumed everywhere (1.5x error). pitch from RANSAC ground plane at this fx. height_m 0.148 from the official MINI+ dimension drawing (195 mm body, 148 mm to camera centre; 250x190 mm footprint, 160 mm wheelbase). Lens shows visible barrel distortion, so pinhole degrades near the frame edges. | INDOOR UNIT (2026-09-22): pitch re-measured from the floor horizon. SegFormer floor masks on 60+ long-corridor frames (both laps) put the farthest floor at rows 150-155 of 288, so the horizon is ~row 302 of 576, i.e. the camera points ~2.4 deg UP, not 3 deg down. With the old pitch every ground distance (cones, floor boundary) came out ~2x too short."
+}
