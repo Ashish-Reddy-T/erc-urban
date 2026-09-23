@@ -1,0 +1,27 @@
+# erc_indoor + erc_urban (+ the ERC-3 LogoNav / Depth Anything code they load).
+# Python 3.10. Pins are the versions in the team's working `rover_env`.
+#
+# The SDK server (earth-rovers-sdk/) is NOT in here: it pins numpy 1.26 and
+# runs in its own venv (setup.sh creates earth-rovers-sdk/.venv).
+
+numpy==2.2.6
+opencv-python==5.0.0.93
+pillow==12.2.0
+requests==2.32.3
+
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.8.0          # SegFormer free-space / semantics
+huggingface_hub==1.14.0
+
+h5py==3.11.0                 # erc_indoor teach-lap recordings
+matplotlib==3.10.8
+pandas==2.3.3
+pyyaml==6.0.3                # LogoNav config
+utm==0.9.0                   # LogoNav GPS goal
+efficientnet_pytorch==0.7.1  # LogoNav backbone (ERC-3 vint_train)
+
+pytest==8.3.5
+
+# Optional: VLM selector (erc_urban, USE_VLM=1) via Vertex AI.
+# google-genai==2.17.0

@@ -1,0 +1,40 @@
+# Reference clones of upstream papers' code. Fact-checking material only —
+# nothing here is ever imported at runtime. See repos/README.md.
+repos/
+
+# Model weights. logonav.pth alone is 309 MB (over GitHub's 100 MB file cap).
+# setup.sh downloads every checkpoint from HuggingFace instead.
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Datasets and run artifacts. /data/ is root-only: erc_indoor/data/route_map
+# (the teach map erc_indoor.run needs) is tracked. The 509 MB teach-lap .h5
+# is only needed to rebuild that map, so it stays out.
+/data/
+runs/
+outputs/
+*.h5
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# The team shares one FrodoBots key, so earth-rovers-sdk/.env is tracked on
+# purpose. Keep the repo private. Vertex AI keys stay out.
+*-service-account.json
+*.bak.*
+
+# macOS
+.DS_Store
+
+.vscode/
+.claude/
+
+plan.md

@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# OS / editor noise
+.DS_Store
+
+# Local secrets / machine-specific config
+earth-rovers-sdk/.env
+CLAUDE.md
+
+# Runtime outputs
+*.log
+*.out
+*.h5
+CONTEXT.md
+guide.md
+*.tex
+docs/
+earth-rovers-sdk/screenshots/
+
+# Local handoff / working notes
+CONTEXT.md
+chat_handoff.md
+chat_session_reconstructed.md
+codex_handoff_prompt.md
+professor_presentation_2026_03_31_notes.md
+professor_presentation_*_notes.md
+professor_presentation_*.tex
+competition_technical_report_*.tex
+nyutemplate/
+
+# Local extra clones / side worktrees
+nyu-earthrover-main/
+nyu_template/
+
+# Generated baseline artifacts and experiment outputs
+artifacts/
+outputs/
+runs/
+data/
+recordings/
+scripts/semantic_corridor_debug/
+scripts/semantic_debug/
+scripts/semantic_debug_v2/
+scripts/trav_debug/
+test_outdoor/
+*.npz
+*.npy
+*.mp4
+*.gif
+
+# Model weights and large local assets
+models/*
+!models/README.md
+*.pth
+*.pt
+*.ckpt
+third_party/Depth-Anything-V2/checkpoints/
+mbra_repo/deployment/model_weights/*
+!mbra_repo/deployment/model_weights/
+!mbra_repo/deployment/model_weights/README.md
+
+mbra_repo_1/train/wandb
+mbra_repo_1/train/logs
+mbra_repo_1/deployment/model_weights
+__pycache__/
+*.pyc
+map_cache
+mbra_repo_1/train/vint_train/data/sampler
+mbra_repo_1/train/config/LogoNav_.yaml
+download_youtube/videos
+mbra_repo_1/deployment/model_weights
+mbra_repo_1/lerobot

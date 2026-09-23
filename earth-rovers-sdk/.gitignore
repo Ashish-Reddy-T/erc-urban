@@ -1,0 +1,20 @@
+.DS_Store
+__pycache__/
+.vscode/
+.openclaw/
+
+# Openclaw workspace files (personal config — templates are in examples/openclaw/)
+/AGENTS.md
+/SOUL.md
+/IDENTITY.md
+/USER.md
+/TOOLS.md
+/HEARTBEAT.md
+/CLAUDE.md
+/MEMORY.md
+front.png
+
+node_modules/
+screenshots/*.png
+static/*.mp3
+static/*.wav
