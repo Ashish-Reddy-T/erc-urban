@@ -69,6 +69,8 @@ Terminal 2, a stack (`conda activate rover_env` first):
 
 ### Indoor (`erc_indoor`)
 
+How the whole stack works, start to finish: [erc_indoor/doc/HOW_IT_WORKS.md](erc_indoor/doc/HOW_IT_WORKS.md).
+
 No SDK mission and no GPS indoors; checkpoints are judged at the cones.
 Put the rover at the orange Start/Finish cone, facing down the glass atrium with
 the windows on the RIGHT (how the teach lap began).
