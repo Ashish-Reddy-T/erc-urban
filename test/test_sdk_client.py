@@ -19,6 +19,18 @@ def _png_b64(color=(255, 0, 0), size=(4, 4)) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+class TestSdkClientDefaults(unittest.TestCase):
+    def test_default_http_timeout_is_short(self):
+        """Hung HTTP must not block a whole urban control tick (indoor uses ~3s)."""
+        client = RoverClient("http://localhost:8000")
+        self.assertLessEqual(client.timeout, 5.0)
+        self.assertEqual(client.timeout, 3.0)
+
+    def test_constructor_timeout_override(self):
+        client = RoverClient("http://localhost:8000", timeout=1.0)
+        self.assertEqual(client.timeout, 1.0)
+
+
 class TestSdkClientParse(unittest.TestCase):
     def setUp(self):
         self.client = RoverClient("http://localhost:8000", timeout=1.0)
