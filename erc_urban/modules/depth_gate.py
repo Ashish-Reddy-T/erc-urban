@@ -153,4 +153,6 @@ class DepthObstacleGate:
             self._last = out
             return out
         except Exception as e:
-            return DepthClearance(False, 99.0, f"depth_err:{e}")
+            return DepthClearance(
+                True, 0.0, f"depth_err:{e}", linear_scale=0.0, turn_rad=None
+            )
