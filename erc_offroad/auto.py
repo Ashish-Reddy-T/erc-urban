@@ -128,6 +128,11 @@ def _wrapr(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+def gps_relative_bearing_rad(brg_cw_deg: float, yaw_cw_deg: float) -> float:
+    # brg and yaw are CW-from-North; terrain bearings are left-positive.
+    return math.radians(_wrap180(-(brg_cw_deg - yaw_cw_deg)))
+
+
 def _wedged(d_yaw: float, corr: float, moved: bool, was_turn: bool) -> bool:
     if not moved:
         return False
@@ -221,7 +226,7 @@ def main(argv=None) -> int:
                             cps[idx]["lat"], cps[idx]["lon"])
             yaw = raw.get("orientation")
             if yaw is not None:
-                goal_b = math.radians(_wrap180(brg - float(yaw)))
+                goal_b = gps_relative_bearing_rad(brg, float(yaw))
                 goal_note = f"cp{cps[idx]['seq']} {dist:.0f}m"
                 if dist <= 15.0 and idx < len(cps) - 1:
                     idx += 1
