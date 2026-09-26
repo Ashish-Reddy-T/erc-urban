@@ -22,7 +22,10 @@ class TestSendControlGuard(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "SEND_CONTROL"}
         with patch.dict(os.environ, env, clear=True):
             mod = importlib.reload(run)
-        self.assertTrue(mod.SEND_CONTROL)
+        try:
+            self.assertTrue(mod.SEND_CONTROL)
+        finally:
+            importlib.reload(run)
 
     def test_dry_run_cmd_and_halt_send_nothing(self):
         client = MagicMock()
