@@ -535,13 +535,19 @@ async def get_data():
     if age is not None and age > RTM_STALE_S:
         await _rtm_recover(f"state={status.get('state')} reason={status.get('reason')} age={age:.1f}")
     # Headless RTM often returns null after restart while the dashboard tab
-    # still shows "Message from Peer". Rejoin once and retry.
+    # still shows "Message from Peer". Rejoin once and retry, but share the
+    # stale-RTM cooldown: the client polls /data at ~17 Hz, and closing Chrome
+    # on every null poll means the page never gets time to rejoin.
     if data is None:
-        logger.warning("/data got null rtm_data — reinitializing headless browser")
-        try:
-            await browser_service.close_browser()
-        except Exception:
-            pass
+        global _rtm_last_reinit
+        now = time.time()
+        if now - _rtm_last_reinit >= RTM_REINIT_COOLDOWN_S:
+            _rtm_last_reinit = now
+            logger.warning("/data got null rtm_data — reinitializing headless browser")
+            try:
+                await browser_service.close_browser()
+            except Exception:
+                pass
         data = await browser_service.data()
     return JSONResponse(content=data)
 
