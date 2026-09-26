@@ -6,7 +6,8 @@ Main control loop. This is the file you actually execute.
 
 Mission mode (default): start mission -> drive checkpoints -> /checkpoint-reached.
 Free-drive: USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban_test.run
-Dry run (perceive + plan + log, no motion):
+Dry run (perceive + plan + log, no motion, no mission POSTs):
+    SEND_CONTROL=0 python -m erc_urban_test.run
     SEND_CONTROL=0 USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban_test.run
 
 Older earth-rovers-sdk builds have no /status or /missions; neither is required.
@@ -48,8 +49,10 @@ USE_OBS_STOP = os.environ.get("USE_OBS_STOP", "1") != "0"
 # Metric depth clearance. Falls back silently if the checkpoint is missing.
 USE_DEPTH = os.environ.get("USE_DEPTH", "1") != "0"
 LAMP = int(os.environ.get("LAMP", "1"))
-# SEND_CONTROL=0: dry run. _cmd/_halt become no-ops so the rover never moves;
-# the loop still perceives, plans and logs. Same flag as erc_indoor.run.
+# SEND_CONTROL=0: dry run. _cmd/_halt become no-ops so the rover never moves,
+# and _start_mission/_claim skip their POSTs so a dry run cannot start or
+# score a real mission (GET /checkpoints still runs). The loop still
+# perceives, plans and logs. Same flag as erc_indoor.run.
 SEND_CONTROL = os.environ.get("SEND_CONTROL", "1") != "0"
 # Only STOP to pivot for large errors: a stop-and-settle cycle costs ~3 s, so
 # anything steerable while rolling should be steered.
@@ -425,6 +428,20 @@ def _halt(client: RoverClient) -> None:
     client.send_cmd(0.0, 0.0, lamp=LAMP)
 
 
+def _start_mission(client: RoverClient) -> dict:
+    if not SEND_CONTROL:
+        print("SEND_CONTROL=0: skipping POST /start-mission (dry run)")
+        return {"message": "dry run: start-mission skipped"}
+    return client.start_mission()
+
+
+def _claim(client: RoverClient) -> dict:
+    if not SEND_CONTROL:
+        print("SEND_CONTROL=0: skipping POST /checkpoint-reached (dry run)")
+        return {"message": "dry run: checkpoint-reached skipped"}
+    return client.checkpoint_reached()
+
+
 def _align_cmd(bearing: float) -> tuple[float, float]:
     """Pivot toward goal; never drive forward while facing the wrong way."""
     err_deg = float(np.degrees(bearing))
@@ -609,7 +626,7 @@ def resolve_goals(
         try:
             if os.environ.get("SKIP_START_MISSION", "0") == "0":
                 print("starting mission...")
-                started = client.start_mission()
+                started = _start_mission(client)
                 print("start-mission ok:", started.get("message", started))
             cps, latest = client.get_checkpoints()
             remaining = [c for c in cps if c.sequence > latest]
@@ -889,7 +906,7 @@ def step(client, planner, controller, goal,
         _halt(client)
         if not mission_mode:
             return True
-        resp = client.checkpoint_reached()
+        resp = _claim(client)
         if resp.get("_http_status", 200) >= 400:
             print(f"checkpoint-reached rejected (rng={rng:.1f}m): {resp}")
             return False
@@ -1849,7 +1866,7 @@ def main():
             print(f"already within 15 m of {goal} — claiming without driving")
             _halt(client)
             if mission_mode:
-                resp = client.checkpoint_reached()
+                resp = _claim(client)
                 print(f"checkpoint-reached: {resp}")
                 if resp.get("_http_status", 200) >= 400:
                     print("claim failed; will drive carefully")
