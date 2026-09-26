@@ -724,7 +724,9 @@ class Navigator:
         lo, hi = -ESCAPE_MAX_SWING_DEG - swung, ESCAPE_MAX_SWING_DEG - swung
         want = float(np.clip(want, lo, hi))
 
-        if fs.ahead_m >= NEED_M and abs(want) < 10:
+        # A hung-up rover can see clear floor while facing the route; that is
+        # exactly when the forced reverse has to win over "clear, drive on".
+        if fs.ahead_m >= NEED_M and abs(want) < 10 and not self._force_reverse:
             self.mode = "DRIVE"
             self._move_ref = None
             return Cmd(0.0, 0.0, 0.3, "DRIVE", f"escape done, {fs.ahead_m:.1f} m clear")
