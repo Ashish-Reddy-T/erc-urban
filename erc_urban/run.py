@@ -705,6 +705,19 @@ def _wrap_rad(a: float) -> float:
     return float((a + np.pi) % (2 * np.pi) - np.pi)
 
 
+def depth_turn_to_wp(turn_rad: float, scale: float) -> tuple[float, float]:
+    """Map ERC-3 depth turn_rad to a robot-frame (x_fwd, y_left) waypoint.
+
+    ERC-3 outdoor_traversability yaw bins are image-right-positive
+    (arctan((u-cx)/fx)); erc_urban waypoints are left-positive (y = sin).
+    Negate at this urban boundary rather than forking ERC-3.
+    """
+    turn = -float(turn_rad)
+    x = max(0.15, abs(float(np.cos(turn))) * float(scale))
+    y = float(np.sin(turn)) * float(scale)
+    return x, y
+
+
 def _reverse_ticks() -> tuple[int, str]:
     if _REAR_SEEN:
         return REVERSE_TICKS, ""
@@ -1819,8 +1832,8 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
         if depth_view is not None and depth_view.turn_rad is not None and not depth_view.blocked:
             scale = max(0.25, float(depth_view.linear_scale))
             wp = wp.copy()
-            wp[0, 0] = max(0.15, abs(np.cos(depth_view.turn_rad)) * scale)
-            wp[0, 1] = np.sin(depth_view.turn_rad) * scale
+            # ERC-3 turn_rad is right-positive; convert to left-positive wp.
+            wp[0, 0], wp[0, 1] = depth_turn_to_wp(depth_view.turn_rad, scale)
         lin, ang = controller.command(wp)
         if path is not None and STAGE <= 1:
             ang = float(np.clip(ang + 0.10 * path.center_offset, -1.0, 1.0))
