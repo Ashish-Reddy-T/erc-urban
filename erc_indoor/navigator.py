@@ -683,6 +683,7 @@ class Navigator:
         self._prog_hist = []
         self._escape_phase = "stop"
         self._escape_until = obs.now + ESCAPE_SETTLE_S
+        self._force_reverse = force_reverse
         self._escapes += 1
         self._e_f = self._c_f = None
         self._i_term, self._i_t = 0.0, None
