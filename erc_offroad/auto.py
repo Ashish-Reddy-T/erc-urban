@@ -165,7 +165,12 @@ def back_and_fill(rec_log, side: float) -> str:
     if ref is None:
         return "no attitude"
     print("    back-and-fill: reverse")
-    _stream(-0.32, 0.0, 1.0, ref, rec_log, allow_tilt_abort=False)
+    ok, reason = _stream(-0.32, 0.0, 1.0, ref, rec_log, allow_tilt_abort=False)
+    if not ok:
+        # Only the absolute-tilt abort survives allow_tilt_abort=False, so the
+        # rover is tipping: pivoting now is how it goes over.
+        print(f"    back-and-fill: {reason} - no turn")
+        return f"back-and-fill aborted: {reason}"
     time.sleep(0.8)
     ref = _ref_attitude() or ref
     print(f"    back-and-fill: turn {'right' if side > 0 else 'left'}")
