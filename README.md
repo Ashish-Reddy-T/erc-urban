@@ -99,6 +99,7 @@ not in git — ask Ashish).
 ```bash
 python -m erc_urban.run                                   # mission mode: start mission -> drive checkpoints -> claim
 USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban.run   # free-drive to one GPS goal
+SEND_CONTROL=0 USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban.run   # dry run: no motion
 ```
 
 **Mission mode needs `MISSION_SLUG=...` in `earth-rovers-sdk/.env`** (from the

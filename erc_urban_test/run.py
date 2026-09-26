@@ -6,6 +6,8 @@ Main control loop. This is the file you actually execute.
 
 Mission mode (default): start mission -> drive checkpoints -> /checkpoint-reached.
 Free-drive: USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban_test.run
+Dry run (perceive + plan + log, no motion):
+    SEND_CONTROL=0 USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban_test.run
 
 Older earth-rovers-sdk builds have no /status or /missions; neither is required.
 """
@@ -46,6 +48,9 @@ USE_OBS_STOP = os.environ.get("USE_OBS_STOP", "1") != "0"
 # Metric depth clearance. Falls back silently if the checkpoint is missing.
 USE_DEPTH = os.environ.get("USE_DEPTH", "1") != "0"
 LAMP = int(os.environ.get("LAMP", "1"))
+# SEND_CONTROL=0: dry run. _cmd/_halt become no-ops so the rover never moves;
+# the loop still perceives, plans and logs. Same flag as erc_indoor.run.
+SEND_CONTROL = os.environ.get("SEND_CONTROL", "1") != "0"
 # Only STOP to pivot for large errors: a stop-and-settle cycle costs ~3 s, so
 # anything steerable while rolling should be steered.
 ALIGN_DEG = float(os.environ.get("ALIGN_DEG", "65"))
@@ -409,10 +414,14 @@ def _note_blocked(reason: str = "") -> None:
 
 
 def _cmd(client: RoverClient, lin: float, ang: float) -> None:
+    if not SEND_CONTROL:
+        return
     client.send_cmd(lin, ang, lamp=LAMP)
 
 
 def _halt(client: RoverClient) -> None:
+    if not SEND_CONTROL:
+        return
     client.send_cmd(0.0, 0.0, lamp=LAMP)
 
 
@@ -1807,7 +1816,8 @@ def main():
         f"planner={type(planner).__name__} ready={ready} "
         f"USE_OBS_STOP={USE_OBS_STOP} USE_DEPTH={USE_DEPTH} "
         f"USE_LOCALMAP={USE_LOCALMAP} USE_EXPLORE={USE_EXPLORE} "
-        f"LAMP={'on' if LAMP else 'off'}"
+        f"LAMP={'on' if LAMP else 'off'} "
+        f"SEND_CONTROL={SEND_CONTROL}"
     )
     wait_for_sdk(client)
     dg = _depth_gate()
