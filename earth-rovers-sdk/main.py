@@ -411,13 +411,19 @@ async def control(request: Request):
         raise HTTPException(status_code=400, detail="Command not provided")
 
     try:
-        await browser_service.send_message(command)
-        return {"message": "Command sent successfully"}
+        ok = await browser_service.send_message(command)
     except Exception as e:
         logger.error("Error sending control command: %s", str(e))
         raise HTTPException(
             status_code=500, detail="Failed to send control command"
         ) from e
+    if not ok:
+        # RTM session dead or sendMessageToPeer rejected. Surface as 503 so
+        # callers that check status can stop; RoverClient.send_cmd ignores
+        # status today, so this does not raise there.
+        logger.warning("RTM send failed for /control (ok=%s)", ok)
+        raise HTTPException(status_code=503, detail="RTM send failed")
+    return {"message": "Command sent successfully"}
 
 
 @app.post("/speak")
