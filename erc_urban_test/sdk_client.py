@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -23,6 +24,11 @@ from typing import Any, Optional
 import numpy as np
 import requests
 from PIL import Image
+
+
+def _default_timeout_s() -> float:
+    """Short default so a hung SDK cannot block a whole urban control tick."""
+    return float(os.environ.get("SDK_TIMEOUT_S", "3.0"))
 
 
 @dataclass
@@ -56,10 +62,16 @@ class Checkpoint:
 
 
 class RoverClient:
-    def __init__(self, base_url: str = "http://localhost:8000", timeout: float = 60.0):
-        # Default 60s: first /data or /v2/screenshot can launch headless Chrome.
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        timeout: Optional[float] = None,
+    ):
+        # Default 3s (or SDK_TIMEOUT_S). Constructor override still wins.
+        # Indoor uses ~3s so a hung HTTP call cannot stall the control tick.
+        # The slow first request (Chrome launch) is paid once in warm_up().
         self.base = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = _default_timeout_s() if timeout is None else float(timeout)
 
     # ---- control -----------------------------------------------------------
     def send_cmd(self, linear: float, angular: float, lamp: Optional[int] = None) -> None:
@@ -192,6 +204,19 @@ class RoverClient:
             return None
         r.raise_for_status()
         return r.json()
+
+    def warm_up(self, timeout_s: float = 90.0) -> bool:
+        """One /data GET with a long timeout, before the control loop starts.
+
+        The first request makes the SDK launch headless Chrome, which takes far
+        longer than the per-tick timeout. Paying it once here keeps the short
+        timeout for every tick after.
+        """
+        try:
+            r = requests.get(f"{self.base}/data", timeout=timeout_s)
+            return r.status_code < 500
+        except Exception:
+            return False
 
     def ping(self) -> bool:
         """True if something is listening on http://localhost:8000."""
