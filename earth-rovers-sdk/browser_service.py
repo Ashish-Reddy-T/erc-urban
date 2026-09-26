@@ -177,14 +177,21 @@ class BrowserService:
         return rear_frame
 
     async def send_message(self, message: dict):
+        """Relay a control command through the page RTM session.
+
+        Returns True when the page reports the peer send succeeded, False
+        when the session is dead or sendMessageToPeer rejects. Callers
+        (POST /control) must not claim success on False.
+        """
         await self.initialize_browser()
 
-        await self.page.evaluate(
-            """(message) => {
-                window.sendMessage(message);
+        result = await self.page.evaluate(
+            """async (message) => {
+                return await window.sendMessage(message);
             }""",
             message,
         )
+        return bool(result)
 
     async def speak(self, audio_url: str):
         await self.initialize_browser()
