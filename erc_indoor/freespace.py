@@ -69,7 +69,7 @@ def path_clear(pts: np.ndarray, heading_deg: float, half_w: float = HALF_WIDTH_M
     """Distance the rover can drive along heading before its body strip meets
     an obstacle foot."""
     if pts is None or len(pts) == 0:
-        return CAP_M
+        return 0.0
     a = np.radians(heading_deg)
     c, s_ = np.cos(a), np.sin(a)
     x = pts[:, 0] * c + pts[:, 1] * s_          # along the heading
