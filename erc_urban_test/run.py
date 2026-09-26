@@ -695,6 +695,30 @@ def _wrap_rad(a: float) -> float:
     return float((a + np.pi) % (2 * np.pi) - np.pi)
 
 
+def depth_turn_to_wp(turn_rad: float, scale: float) -> tuple[float, float]:
+    """Map ERC-3 depth turn_rad to a robot-frame (x_fwd, y_left) waypoint.
+
+    ERC-3 outdoor_traversability yaw bins are image-right-positive
+    (arctan((u-cx)/fx)); erc_urban waypoints are left-positive (y = sin).
+    Negate at this urban boundary rather than forking ERC-3.
+    """
+    turn = -float(turn_rad)
+    x = max(0.15, abs(float(np.cos(turn))) * float(scale))
+    y = float(np.sin(turn)) * float(scale)
+    return x, y
+
+
+def depth_evaluate(dg, front, bearing: float):
+    """Run the depth gate with a left-positive robot-frame goal bearing.
+
+    OutdoorTraversability picks the open yaw bin closest to the goal, and its
+    bins are right-positive, so the bearing is negated going in just as
+    turn_rad is negated coming out. Without this the gate prefers the open
+    gap on the mirror side of the goal.
+    """
+    return dg.evaluate(front, -float(bearing))
+
+
 def _reverse_ticks() -> tuple[int, str]:
     if _REAR_SEEN:
         return REVERSE_TICKS, ""
@@ -933,7 +957,7 @@ def step(client, planner, controller, goal,
     depth_view = None
     dg = _depth_gate()
     if dg is not None:
-        depth_view = dg.evaluate(front, bearing)
+        depth_view = depth_evaluate(dg, front, bearing)
 
     # Ground-relative costmap, reusing the depth map just computed. Unlike the
     # fixed-band clearance it sees low, close obstacles in the bottom of the
@@ -1723,8 +1747,8 @@ def step(client, planner, controller, goal,
         if depth_view is not None and depth_view.turn_rad is not None and not depth_view.blocked:
             scale = max(0.25, float(depth_view.linear_scale))
             wp = wp.copy()
-            wp[0, 0] = max(0.15, abs(np.cos(depth_view.turn_rad)) * scale)
-            wp[0, 1] = np.sin(depth_view.turn_rad) * scale
+            # ERC-3 turn_rad is right-positive; convert to left-positive wp.
+            wp[0, 0], wp[0, 1] = depth_turn_to_wp(depth_view.turn_rad, scale)
         lin, ang = controller.command(wp)
         # Reuses the `pre_aim` computed above the stop gates rather than
         # calling align() again with identical arguments: one aim per tick means

@@ -744,6 +744,17 @@ def depth_turn_to_wp(turn_rad: float, scale: float) -> tuple[float, float]:
     return x, y
 
 
+def depth_evaluate(dg, front, bearing: float):
+    """Run the depth gate with a left-positive robot-frame goal bearing.
+
+    OutdoorTraversability picks the open yaw bin closest to the goal, and its
+    bins are right-positive, so the bearing is negated going in just as
+    turn_rad is negated coming out. Without this the gate prefers the open
+    gap on the mirror side of the goal.
+    """
+    return dg.evaluate(front, -float(bearing))
+
+
 def _reverse_ticks() -> tuple[int, str]:
     if _REAR_SEEN:
         return REVERSE_TICKS, ""
@@ -985,7 +996,7 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     depth_view = None
     dg = _depth_gate()
     if dg is not None:
-        depth_view = dg.evaluate(front, bearing)
+        depth_view = depth_evaluate(dg, front, bearing)
 
     # Ground-relative costmap, reusing the depth map just computed. Unlike the
     # fixed-band clearance it sees low, close obstacles in the bottom of the
