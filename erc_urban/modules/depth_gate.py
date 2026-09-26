@@ -153,6 +153,10 @@ class DepthObstacleGate:
             self._last = out
             return out
         except Exception as e:
-            return DepthClearance(
+            # Fail closed, and cache it: with every_n > 1 the skipped ticks
+            # replay _last, which must not be an older clear result.
+            out = DepthClearance(
                 True, 0.0, f"depth_err:{e}", linear_scale=0.0, turn_rad=None
             )
+            self._last = out
+            return out
