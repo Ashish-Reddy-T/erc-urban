@@ -276,8 +276,15 @@ def _stream(lin: float, ang: float, seconds: float, base: dict, log,
             rate = max(abs(a.roll - prev_roll), abs(a.pitch - prev_pitch))
         prev_roll, prev_pitch = a.roll, a.pitch
 
+        # Absolute tilt always aborts: past it the rover is going over whichever
+        # way it drives. allow_tilt_abort=False (recovery reverses) only drops
+        # the delta and lurch checks, which reversing off a hump trips by design.
+        if a.tilt > ABORT_ABS_DEG:
+            _post("/control", {"command": {"linear": 0.0, "angular": 0.0}})
+            return False, (f"ABS TILT ABORT abs={a.tilt:.1f} "
+                           f"d_roll={dr:+.1f} d_pitch={dp:+.1f}")
         if allow_tilt_abort:
-            if worst > ABORT_DELTA_DEG or a.tilt > ABORT_ABS_DEG:
+            if worst > ABORT_DELTA_DEG:
                 _post("/control", {"command": {"linear": 0.0, "angular": 0.0}})
                 return False, (f"TILT ABORT d_roll={dr:+.1f} d_pitch={dp:+.1f} "
                                f"abs={a.tilt:.1f}")
@@ -317,8 +324,11 @@ def cmd_nudge(args) -> int:
             # Blind (no rear camera), so it is short and it is bounded.
             for attempt in (1, 2):
                 print(f"  RECOVER {attempt}/2: reverse burst 0.6s")
-                _stream(-abs(args.recover_linear), 0.0, 0.6, base, log,
-                        allow_tilt_abort=False)
+                rok, rreason = _stream(-abs(args.recover_linear), 0.0, 0.6, base, log,
+                                       allow_tilt_abort=False)
+                if not rok:
+                    print(f"     {rreason} - stop and look at the rover")
+                    return 2
                 time.sleep(0.4)
                 a = attitude(_get("/data"))
                 if a is None:
