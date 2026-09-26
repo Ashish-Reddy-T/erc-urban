@@ -621,6 +621,8 @@ def wait_for_sdk(client: RoverClient, timeout_s: float = 30.0) -> None:
                 print("SDK HTTP up (no /status on this build — ok)")
             else:
                 print(f"SDK ready: {st}")
+            if not client.warm_up():
+                print("SDK warm-up /data failed; early ticks may time out")
             return
         print("waiting for SDK on", client.base, "...")
         time.sleep(1.0)

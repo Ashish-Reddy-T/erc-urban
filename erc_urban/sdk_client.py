@@ -69,6 +69,7 @@ class RoverClient:
     ):
         # Default 3s (or SDK_TIMEOUT_S). Constructor override still wins.
         # Indoor uses ~3s so a hung HTTP call cannot stall the control tick.
+        # The slow first request (Chrome launch) is paid once in warm_up().
         self.base = base_url.rstrip("/")
         self.timeout = _default_timeout_s() if timeout is None else float(timeout)
 
@@ -176,6 +177,19 @@ class RoverClient:
             return None
         r.raise_for_status()
         return r.json()
+
+    def warm_up(self, timeout_s: float = 90.0) -> bool:
+        """One /data GET with a long timeout, before the control loop starts.
+
+        The first request makes the SDK launch headless Chrome, which takes far
+        longer than the per-tick timeout. Paying it once here keeps the short
+        timeout for every tick after.
+        """
+        try:
+            r = requests.get(f"{self.base}/data", timeout=timeout_s)
+            return r.status_code < 500
+        except Exception:
+            return False
 
     def ping(self) -> bool:
         """True if something is listening on http://localhost:8000."""
