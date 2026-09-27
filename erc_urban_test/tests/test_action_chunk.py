@@ -28,6 +28,27 @@ class TestChunkIndex(unittest.TestCase):
         self.assertEqual(chunk_index(float("nan")), 0)
         self.assertEqual(chunk_index(float("inf")), 0)
 
+    def test_exact_step_boundaries_select_that_step(self):
+        # 0.3 / 0.1 == 2.9999999999999996 in binary floating point.
+        got = {e: chunk_index(e, dt_s=0.1) for e in (0.3, 0.6, 0.7, 0.9)}
+        self.assertEqual(got, {0.3: 3, 0.6: 6, 0.7: 7, 0.9: 9})
+
+    def test_every_step_boundary_selects_that_step(self):
+        horizon = 10
+        for dt in (0.1, 0.05, 0.2, 1.0 / 15.0):
+            for k in range(horizon):
+                for elapsed in (k * dt, round(k * dt, 9)):
+                    with self.subTest(dt=dt, k=k, elapsed=elapsed):
+                        self.assertEqual(
+                            chunk_index(elapsed, dt_s=dt, horizon=horizon), k
+                        )
+
+    def test_just_below_boundary_stays_on_previous_step(self):
+        self.assertEqual(chunk_index(0.2999, dt_s=0.1), 2)
+
+    def test_ratio_overflow_clamps_to_last_step(self):
+        self.assertEqual(chunk_index(1e308, dt_s=1e-10, horizon=10), 9)
+
 
 class TestSelectAction(unittest.TestCase):
     def test_selects_row_from_matrix_chunk(self):
