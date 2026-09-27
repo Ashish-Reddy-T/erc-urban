@@ -34,6 +34,8 @@ def _serve(status: int, body: bytes, delay: float = 0.0):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.paths = []
     server.daemon_threads = True
+    # the timeout case writes to a socket the client already closed
+    server.handle_error = lambda request, client_address: None
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
