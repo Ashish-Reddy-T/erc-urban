@@ -60,6 +60,16 @@ class TestSelectAction(unittest.TestCase):
         chunk = np.linspace(0.0, 0.9, 10)
         self.assertAlmostEqual(float(select_action(chunk, 0.0)), 0.0)
 
+    def test_mutating_returned_row_leaves_chunk_unchanged(self):
+        chunk = np.arange(20, dtype=float).reshape(10, 2)
+        row = select_action(chunk, 0.0)
+        row *= 2
+        np.testing.assert_array_equal(chunk[0], np.array([0.0, 1.0]))
+
+    def test_empty_chunk_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            select_action(np.zeros((0, 2)), 0.0)
+
 
 class TestActionChunkExecutor(unittest.TestCase):
     def test_step_before_push_returns_none(self):
@@ -72,6 +82,35 @@ class TestActionChunkExecutor(unittest.TestCase):
         ex.push(chunk, t0=10.0)
         out = ex.step(now=10.25)
         np.testing.assert_allclose(out, np.array([2.0, 0.0]))
+
+    def test_mutating_step_output_leaves_stored_chunk_and_caller_unchanged(self):
+        chunk = np.array([[0.5, 0.2], [0.6, 0.3]])
+        ex = ActionChunkExecutor()
+        ex.push(chunk, t0=0.0)
+        out = ex.step(now=0.0)
+        out *= 2
+        np.testing.assert_allclose(ex.step(now=0.0), np.array([0.5, 0.2]))
+        np.testing.assert_allclose(chunk[0], np.array([0.5, 0.2]))
+
+    def test_caller_mutating_pushed_array_leaves_stored_chunk_unchanged(self):
+        chunk = np.array([[0.5, 0.2], [0.6, 0.3]])
+        ex = ActionChunkExecutor()
+        ex.push(chunk, t0=0.0)
+        chunk[0] = [9.0, 9.0]
+        np.testing.assert_allclose(ex.step(now=0.0), np.array([0.5, 0.2]))
+
+    def test_push_rejects_empty_scalar_or_none_chunk(self):
+        bad = {
+            "empty_list": [],
+            "zeros_0x2": np.zeros((0, 2)),
+            "zero_d": np.array(1.0),
+            "none": None,
+        }
+        for name, chunk in bad.items():
+            with self.subTest(name=name):
+                ex = ActionChunkExecutor()
+                with self.assertRaises(ValueError):
+                    ex.push(chunk, t0=0.0)
 
 
 if __name__ == "__main__":
