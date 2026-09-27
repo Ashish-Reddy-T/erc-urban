@@ -492,6 +492,16 @@ class Navigator:
                 self._avoid_phase = "pass"
                 self._pass_end = obs.now + CONE_PASS_S
             if obs.now < self._pass_end:
+                # The pass drives blind for CONE_PASS_S otherwise: after the
+                # sidestep the rover can be facing a wall or a table leg.
+                # Same stop rule as DRIVE.
+                fs = (self.free.estimate(obs.frame)
+                      if self.free is not None and obs.frame is not None else None)
+                if fs is not None:
+                    self.last_fs = (fs, obs.now)
+                    self.log.ahead_m = fs.ahead_m
+                    if fs.ahead_m < STOP_M:
+                        return self._begin_escape(obs, f"floor ends {fs.ahead_m:.2f} m ahead while passing cone")
                 return Cmd(CONE_PASS_LIN, 0.0, min(0.6, self._pass_end - obs.now), "AVOID", "passing cone")
             self.mode = "DRIVE"
             self._e_f = self._c_f = None
