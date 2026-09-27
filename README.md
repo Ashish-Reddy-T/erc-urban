@@ -123,6 +123,30 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests
 
 `test_live_sdk.py` needs the SDK running with a rover connected.
 
+CI (`.github/workflows/tests.yml`) runs these on every pull request and push to
+`main`, CPU only and without torch (model tests skip without weights). To match
+it locally in a fresh Python 3.10 env:
+
+```bash
+pip install -r requirements-test.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q test --ignore=test/test_live_sdk.py
+cd erc_urban_test && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests; cd ..
+```
+
+The SDK server tests (`test/test_sdk_*.py`, FastAPI TestClient) skip unless
+fastapi and httpx are installed. CI also runs them against the SDK's own pins:
+
+```bash
+pip install -r earth-rovers-sdk/requirements.txt httpx==0.28.1 pillow==12.2.0
+python -m unittest discover -s test -t . -p "test_sdk_*.py" -v
+```
+
+Before a run, check the SDK is answering (exits 1 on failure, uses `$SDK_URL`):
+
+```bash
+python scripts/sdk_healthcheck.py --timeout 3
+```
+
 ## Not in git
 
 | What | Size | Where it comes from |
