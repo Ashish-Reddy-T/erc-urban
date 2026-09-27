@@ -112,5 +112,43 @@ class TestOneForwardPassPerFrame(unittest.TestCase):
         self.assertEqual(good_model.calls, 1)
 
 
+class TestTickBudgetTimesTheForwardPass(unittest.TestCase):
+    """tick_budget's SegFormer row must time a forward pass, not a cache hit."""
+
+    def test_semantics_row_runs_model_every_repeat(self):
+        import contextlib
+        import io
+        import os
+        import sys
+        import tempfile
+        import types
+        from unittest.mock import patch
+
+        from PIL import Image
+
+        from erc_urban.eval import tick_budget
+        from erc_urban.modules import depth_gate, semantics
+
+        def unavailable(*a, **k):
+            raise RuntimeError("not under test")
+
+        sem = _sem()
+        logonav = types.ModuleType("erc_urban.modules.logonav")
+        logonav.LogoNavPlanner = unavailable
+        repeats = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            Image.fromarray(_frame(90)).save(os.path.join(tmp, "f.png"))
+            with patch.dict(sys.modules, {"erc_urban.modules.logonav": logonav}), \
+                    patch.object(depth_gate, "DepthObstacleGate", unavailable), \
+                    patch.object(semantics, "SemanticTraversability",
+                                 lambda device=None: sem), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                tick_budget.main(["--frames", os.path.join(tmp, "*.png"),
+                                  "--device", "cpu",
+                                  "--repeats", str(repeats)])
+        # One warmup plus one forward pass per timed repeat.
+        self.assertEqual(sem.model.calls, 1 + repeats)
+
+
 if __name__ == "__main__":
     unittest.main()
