@@ -1,0 +1,79 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # autoload of third-party pytest plugins is off, see pytest.ini
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  suites:
+    name: offline suites (test/, erc_urban_test/tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      # No torch: model-backed tests skip without downloaded weights.
+      - name: Install test deps
+        run: python -m pip install -r requirements-test.txt
+
+      - name: pytest test/
+        run: python -m pytest -q test --ignore=test/test_live_sdk.py -rs
+
+      - name: pytest erc_urban_test/tests
+        working-directory: erc_urban_test
+        run: python -m pytest -q tests -rs
+
+  sdk:
+    name: earth-rovers-sdk tests (unittest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BOT_SLUG: ci-bot
+      MISSION_SLUG: ci-mission
+      SDK_API_TOKEN: ci-token
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: earth-rovers-sdk/requirements.txt
+
+      # The SDK's own pins (numpy 1.26), plus what the tests need:
+      # httpx for fastapi.testclient, pillow for test_sdk_client.
+      - name: Install SDK deps
+        run: |
+          python -m pip install -r earth-rovers-sdk/requirements.txt
+          python -m pip install httpx==0.28.1 pillow==12.2.0
+
+      - name: unittest test/test_sdk_*.py
+        run: |
+          python -m unittest discover -s test -t . -p "test_sdk_*.py" -v 2>&1 | tee sdk-unittest.log
+          if grep -Eq "skipped=|skipped '" sdk-unittest.log; then
+            echo "::error::SDK tests skipped; fastapi/httpx missing from this env?"
+            exit 1
+          fi
