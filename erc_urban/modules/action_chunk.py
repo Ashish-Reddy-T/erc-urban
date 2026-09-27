@@ -26,7 +26,11 @@ def chunk_index(elapsed_s: float, *, dt_s: float = 0.1, horizon: int = 10) -> in
         return 0
     if dt_s <= 0 or not math.isfinite(dt_s):
         return 0
-    idx = int(elapsed_s / dt_s)
+    # Epsilon absorbs float error at exact boundaries (0.3 / 0.1 == 2.9999999999999996).
+    ratio = elapsed_s / dt_s + 1e-9
+    if not math.isfinite(ratio):
+        return horizon - 1
+    idx = int(math.floor(ratio))
     return min(max(idx, 0), horizon - 1)
 
 
