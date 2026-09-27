@@ -871,6 +871,32 @@ def _begin_pivot(stuck_state: dict, reason: str) -> None:
     )
 
 
+# Telemetry freshness. The SDK adds rtm_age_s (age of the last RTM peer
+# message, on the SDK host clock, so no rover/laptop skew) and rtm_state (the
+# Agora connection state) to every /data payload. When the session is ABORTED
+# (REMOTE_LOGIN: someone else connected) or the last peer message is older than
+# the SDK's own RTM_STALE_S (6 s, earth-rovers-sdk/main.py), lat/lon/yaw are a
+# frozen copy and steering on them is driving blind. Older SDK builds omit
+# both keys; the gate is then a no-op.
+TELEM_STALE_S = float(os.environ.get("TELEM_STALE_S", "6"))
+_RTM_DEAD_STATES = frozenset({"ABORTED", "DISCONNECTED", "TOKEN_EXPIRED"})
+
+
+def _telemetry_dead(tel) -> str | None:
+    """Reason string when this tick's telemetry must not be driven on."""
+    raw = tel.raw if isinstance(tel.raw, dict) else {}
+    state = raw.get("rtm_state")
+    if state in _RTM_DEAD_STATES:
+        return f"rtm_state={state} reason={raw.get('rtm_reason')}"
+    try:
+        age = float(raw.get("rtm_age_s"))
+    except (TypeError, ValueError):
+        return None
+    if age > TELEM_STALE_S:
+        return f"rtm_age_s={age:.1f}"
+    return None
+
+
 def step(client, planner, selector, gate, posebuf, controller, goal,
          mission_mode: bool, stuck_state: dict | None = None,
          route_profile=None, goal_index: int = 0) -> bool:
@@ -882,6 +908,11 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     if rear is not None:
         _REAR_SEEN = True
     tel = client.get_data()
+    dead = _telemetry_dead(tel)
+    if dead is not None:
+        _halt(client)
+        print(f"telemetry stale ({dead}): holding still", flush=True)
+        return False
 
     if np.isnan(tel.lat) or np.isnan(tel.lon):
         return False
