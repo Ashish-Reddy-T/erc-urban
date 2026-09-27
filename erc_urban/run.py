@@ -761,6 +761,17 @@ def _reverse_ticks() -> tuple[int, str]:
     return REVERSE_TICKS_BLIND, " [BLIND: no rear camera — short nudge only]"
 
 
+def depth_override_command(controller, wp, point, scale: float) -> tuple[float, float]:
+    """Steer toward a depth-avoid point instead of the planner's first waypoint.
+
+    point: robot-frame (x_fwd, y_left) override direction, already left-positive.
+    scale: depth gate linear_scale, clamped by the caller.
+    """
+    wp = wp.copy()
+    wp[0, 0], wp[0, 1] = float(point[0]), float(point[1])
+    return controller.command(wp)
+
+
 # Prefer turning around to reversing: a 180 deg turn makes a blind manoeuvre a
 # sensed one, so the veto and costmap apply to the escape as well as the
 # approach. Reversing has neither.
@@ -1899,10 +1910,11 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
         # Depth safety: override the first waypoint if clearance is bad.
         if depth_view is not None and depth_view.turn_rad is not None and not depth_view.blocked:
             scale = max(0.25, float(depth_view.linear_scale))
-            wp = wp.copy()
-            # ERC-3 turn_rad is right-positive; convert to left-positive wp.
-            wp[0, 0], wp[0, 1] = depth_turn_to_wp(depth_view.turn_rad, scale)
-        lin, ang = controller.command(wp)
+            # ERC-3 turn_rad is right-positive; depth_turn_to_wp converts to left-positive.
+            point = depth_turn_to_wp(depth_view.turn_rad, scale)
+            lin, ang = depth_override_command(controller, wp, point, scale)
+        else:
+            lin, ang = controller.command(wp)
         if path is not None and STAGE <= 1:
             ang = float(np.clip(ang + 0.10 * path.center_offset, -1.0, 1.0))
         # Reuses the `pre_aim` computed above the stop gates rather than
