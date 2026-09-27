@@ -207,3 +207,72 @@ def test_bad_rear_keeps_good_front(bad):
 @pytest.mark.parametrize("body", BAD_BODIES + [{}], ids=repr)
 def test_frames_non_dict_body_is_none_pair(body):
     assert _get_frames(body) == (None, None)
+
+
+# ---- downstream: every no-fix shape reaches consumers as the same NaN -------
+
+def _without(key):
+    d = dict(GOOD)
+    d.pop(key)
+    return d
+
+
+NO_FIX_BODIES = {
+    "non_dict_body": None,
+    "missing_lat": _without("latitude"),
+    "missing_lon": _without("longitude"),
+    "null_lat": dict(GOOD, latitude=None),
+    "string_lat": dict(GOOD, latitude="abc"),
+    "nan_lon": dict(GOOD, longitude=NAN),
+    "inf_lat": dict(GOOD, latitude=INF),
+}
+
+
+def _observation(tel: Telemetry):
+    from erc_urban.interfaces import Observation
+    return Observation(
+        front=np.zeros((8, 8, 3), dtype=np.uint8), rear=None,
+        lat=tel.lat, lon=tel.lon, yaw=math.pi / 2, stamp=1.0,
+        goal_bearing=0.0, goal_range_m=10.0,
+    )
+
+
+@pytest.mark.parametrize("name", list(NO_FIX_BODIES))
+def test_no_fix_is_nan_never_none(name):
+    tel = _get_data(NO_FIX_BODIES[name])
+    bad = [v for v in (tel.lat, tel.lon) if math.isnan(v)]
+    assert bad and all(isinstance(v, float) for v in (tel.lat, tel.lon))
+
+
+@pytest.mark.parametrize("name", list(NO_FIX_BODIES))
+def test_gps_health_treats_every_no_fix_like_fallback(name):
+    from erc_urban.run import GpsHealth
+    tel = _get_data(NO_FIX_BODIES[name])
+    ref = GpsHealth()
+    ref_out = ref.update(np.nan, np.nan, None, 5.0)
+    g = GpsHealth()
+    assert g.update(tel.lat, tel.lon, None, 5.0) == ref_out
+    assert g.last_fix is None and ref.last_fix is None
+
+
+@pytest.mark.parametrize("name", list(NO_FIX_BODIES))
+def test_logonav_goal_pose_treats_every_no_fix_like_fallback(name):
+    from erc_urban.modules.logonav import LogoNavPlanner
+    p = LogoNavPlanner(checkpoint_path="/tmp/does_not_exist_logonav.pth")
+    p.set_goal(40.001, -74.0)
+    tel = _get_data(NO_FIX_BODIES[name])
+    assert p.goal_pose(_observation(tel)) is None
+    assert p.goal_pose(_observation(_get_data(GOOD))) is not None
+
+
+@pytest.mark.parametrize("name", list(NO_FIX_BODIES))
+def test_step_skips_tick_on_every_no_fix(name):
+    from erc_urban import run as R
+    client = MagicMock()
+    client.get_frames.return_value = (np.zeros((8, 8, 3), dtype=np.uint8), None)
+    with patch(f"{MOD}.requests.get", return_value=_resp(NO_FIX_BODIES[name])):
+        client.get_data.return_value = RoverClient("http://x", timeout=1.0).get_data()
+    with patch.object(R, "_vo", side_effect=AssertionError("tick ran past GPS gate")):
+        assert R.step(client, None, None, None, None, None, goal=(40.001, -74.0),
+                      mission_mode=False) is False
+    client.send_cmd.assert_not_called()
