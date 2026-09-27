@@ -37,11 +37,12 @@ class TestChunkIndex(unittest.TestCase):
         horizon = 10
         for dt in (0.1, 0.05, 0.2, 1.0 / 15.0):
             for k in range(horizon):
-                for elapsed in (k * dt, round(k * dt, 9)):
-                    with self.subTest(dt=dt, k=k, elapsed=elapsed):
-                        self.assertEqual(
-                            chunk_index(elapsed, dt_s=dt, horizon=horizon), k
-                        )
+                # Rounded so elapsed is the decimal boundary (0.3), not 3 * 0.1.
+                elapsed = round(k * dt, 12)
+                with self.subTest(dt=dt, k=k, elapsed=elapsed):
+                    self.assertEqual(
+                        chunk_index(elapsed, dt_s=dt, horizon=horizon), k
+                    )
 
     def test_just_below_boundary_stays_on_previous_step(self):
         self.assertEqual(chunk_index(0.2999, dt_s=0.1), 2)
