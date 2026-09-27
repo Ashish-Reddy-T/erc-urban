@@ -730,10 +730,20 @@ def depth_override_command(controller, wp, point, scale: float) -> tuple[float, 
 
     point: robot-frame (x_fwd, y_left) override direction, already left-positive.
     scale: depth gate linear_scale, clamped by the caller.
+
+    Pure pursuit ignores waypoints closer than its lookahead and its speed does
+    not depend on waypoint distance, so the point is pushed out to the
+    lookahead along its own direction and `scale` is applied to the speed.
     """
+    x, y = float(point[0]), float(point[1])
+    r = float(np.hypot(x, y))
+    reach = float(controller.lookahead_m) * (1.0 + 1e-6)
+    if 0.0 < r < reach:
+        x, y = x * reach / r, y * reach / r
     wp = wp.copy()
-    wp[0, 0], wp[0, 1] = float(point[0]), float(point[1])
-    return controller.command(wp)
+    wp[0, 0], wp[0, 1] = x, y
+    lin, ang = controller.command(wp)
+    return float(lin * scale), ang
 
 
 # Prefer turning around to reversing: a 180 deg turn makes a blind manoeuvre a
@@ -1791,8 +1801,10 @@ def step(client, planner, controller, goal,
             # ERC-3 turn_rad is right-positive; depth_turn_to_wp converts to left-positive.
             point = depth_turn_to_wp(depth_view.turn_rad, scale)
             lin, ang = depth_override_command(controller, wp, point, scale)
+            depth_scaled = True
         else:
             lin, ang = controller.command(wp)
+            depth_scaled = False
         # Reuses the `pre_aim` computed above the stop gates rather than
         # calling align() again with identical arguments: one aim per tick means
         # the gates, the pivot decision and the steering command can never
@@ -1840,7 +1852,8 @@ def step(client, planner, controller, goal,
         # correctly-scaled depth the gate reads the ground and returns
         # linear_scale=0.0, zeroing the throttle on open pavement. Let it slow
         # the rover only when the costmap is unavailable.
-        if cm_res is None and depth_view is not None and depth_view.linear_scale < 1.0:
+        if (cm_res is None and not depth_scaled and depth_view is not None
+                and depth_view.linear_scale < 1.0):
             lin = float(lin * depth_view.linear_scale)
         # Decelerate into COSTMAP_STOP_M, so the stop is reached at a speed the
         # dead time can absorb.
