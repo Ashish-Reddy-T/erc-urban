@@ -105,8 +105,11 @@ def main(argv=None) -> int:
 
         sem = SemanticTraversability(device=a.device)
         if sem.ready:
+            # labels() caches logits per frame object; each tick decodes a new
+            # frame, so time on a fresh copy or only the cache hit is measured.
             rows.append(("M6 semantics (SegFormer)",
-                         *_timeit(lambda: sem.labels(frame, (144, 256)), a.repeats)))
+                         *_timeit(lambda: sem.labels(frame.copy(), (144, 256)),
+                                  a.repeats)))
     except Exception as e:
         print(f"  semantics unavailable: {e}")
 
@@ -132,7 +135,7 @@ def main(argv=None) -> int:
         from ..modules.traversability import TraversabilityVeto, SegFormerSource
 
         tv = TraversabilityVeto(source=SegFormerSource(semantics=sem), calib=cal)
-        rows.append(("M6 semantic veto (incl. seg)",
+        rows.append(("M6 semantic veto (seg reused)",
                      *_timeit(lambda: tv.mask(obs, cands), a.repeats)))
 
     # --- M5: visual odometry ---------------------------------------------

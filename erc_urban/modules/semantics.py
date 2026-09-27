@@ -79,6 +79,11 @@ class SemanticTraversability:
         self.good: set[int] = set()
         self.notground: set[int] = set()
         self.device = device
+        # The urban tick segments the same frame twice at different out_hw
+        # (depth grid, then TraversabilityVeto.mask_hw). Holding the frame
+        # itself, not id(), keeps a freed frame's id from matching a new one.
+        self._logits_rgb: Optional[np.ndarray] = None
+        self._logits = None
         self._load(device)
 
     def _load(self, device: str) -> None:
@@ -130,14 +135,18 @@ class SemanticTraversability:
             return None
         torch = self._torch
         try:
-            inp = self.proc(
-                images=rgb,
-                return_tensors="pt",
-                size={"height": self.size, "width": self.size},
-            )
-            px = inp["pixel_values"].to(self.device)
-            with torch.no_grad():
-                logits = self.model(pixel_values=px).logits
+            if rgb is self._logits_rgb and self._logits is not None:
+                logits = self._logits
+            else:
+                inp = self.proc(
+                    images=rgb,
+                    return_tensors="pt",
+                    size={"height": self.size, "width": self.size},
+                )
+                px = inp["pixel_values"].to(self.device)
+                with torch.no_grad():
+                    logits = self.model(pixel_values=px).logits
+                self._logits_rgb, self._logits = rgb, logits
             up = torch.nn.functional.interpolate(
                 logits, size=out_hw, mode="bilinear", align_corners=False
             )
