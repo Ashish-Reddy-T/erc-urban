@@ -1,0 +1,24 @@
+# Offline test suites: test/, erc_urban_test/tests/ and the SDK tests in
+# test/test_sdk_*.py (FastAPI TestClient against earth-rovers-sdk/main.py).
+# Python 3.10, CPU only. Pins match rover_env (requirements.txt) and
+# earth-rovers-sdk/.venv (earth-rovers-sdk/requirements.txt).
+#
+# No torch / transformers: the stack imports them lazily and the only test
+# that needs them (LogoNav live load) skips unless logonav.pth is downloaded.
+
+numpy==2.2.6
+opencv-python-headless==5.0.0.93
+pillow==12.2.0
+requests==2.32.3
+pyyaml==6.0.3
+utm==0.9.0
+
+pytest==8.3.5
+
+# SDK server imports (earth-rovers-sdk/requirements.txt minus its numpy pin)
+fastapi==0.111.1
+pydantic==2.8.2
+python-dotenv==1.0.1
+pyppeteer==2.0.0
+aiohttp==3.9.3
+httpx==0.28.1                # fastapi.testclient
