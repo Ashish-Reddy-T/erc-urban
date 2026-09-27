@@ -34,19 +34,40 @@ def chunk_index(elapsed_s: float, *, dt_s: float = 0.1, horizon: int = 10) -> in
     return min(max(idx, 0), horizon - 1)
 
 
-def select_action(chunk: Any, elapsed_s: float, *, dt_s: float = 0.1) -> np.ndarray:
-    """chunk shape (H, A) or (H,); return row at chunk_index."""
+def _as_chunk(chunk: Any) -> np.ndarray:
     arr = np.asarray(chunk)
-    if arr.ndim == 0:
-        horizon = 1
-    else:
-        horizon = int(arr.shape[0])
-    idx = chunk_index(elapsed_s, dt_s=dt_s, horizon=horizon)
-    return np.asarray(arr[idx])
+    if arr.ndim == 0 or arr.shape[0] < 1:
+        raise ValueError(
+            f"action chunk must have at least one row, got shape {arr.shape}"
+        )
+    return arr
+
+
+def select_action(chunk: Any, elapsed_s: float, *, dt_s: float = 0.1) -> np.ndarray:
+    """chunk shape (H, A) or (H,) with H >= 1; return a copy of the row at chunk_index.
+
+    Raises ValueError for an empty or 0-d chunk.
+    """
+    arr = _as_chunk(chunk)
+    idx = chunk_index(elapsed_s, dt_s=dt_s, horizon=int(arr.shape[0]))
+    return np.array(arr[idx], copy=True)
 
 
 class ActionChunkExecutor:
-    """Holds latest chunk + t0 monotonic; step(now) returns action for elapsed."""
+    """Holds latest chunk + t0; step(now) returns a copy of the action for elapsed.
+
+    Clock contract: t0 and now must come from the same clock. The planner stamps
+    time.monotonic() (the default when t0/now are omitted).
+
+    push() stores a copy and rejects empty or 0-d chunks with ValueError.
+
+    Elapsed past the chunk end returns the last row for finite elapsed, but row 0
+    for non-finite elapsed (inf, NaN), same as negative elapsed.
+
+    There is no staleness cutoff or clear() yet: step() keeps returning a row of the
+    last chunk forever. The caller must enforce max age and stop behavior; max_age_s,
+    the negative-age check and clear() are deferred to the NS wiring PR.
+    """
 
     def __init__(self, *, dt_s: float = 0.1) -> None:
         self.dt_s = dt_s
@@ -54,7 +75,7 @@ class ActionChunkExecutor:
         self._t0: Optional[float] = None
 
     def push(self, chunk: Any, t0: float | None = None) -> None:
-        self._chunk = np.asarray(chunk)
+        self._chunk = np.array(_as_chunk(chunk), copy=True)
         self._t0 = t0 if t0 is not None else time.monotonic()
 
     def step(self, now: float | None = None) -> np.ndarray | None:
