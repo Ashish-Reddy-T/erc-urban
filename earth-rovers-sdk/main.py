@@ -411,13 +411,19 @@ async def control(request: Request):
         raise HTTPException(status_code=400, detail="Command not provided")
 
     try:
-        await browser_service.send_message(command)
-        return {"message": "Command sent successfully"}
+        ok = await browser_service.send_message(command)
     except Exception as e:
         logger.error("Error sending control command: %s", str(e))
         raise HTTPException(
             status_code=500, detail="Failed to send control command"
         ) from e
+    if not ok:
+        # RTM session dead or sendMessageToPeer rejected. Surface as 503 so
+        # callers that check status can stop; RoverClient.send_cmd ignores
+        # status today, so this does not raise there.
+        logger.warning("RTM send failed for /control (ok=%s)", ok)
+        raise HTTPException(status_code=503, detail="RTM send failed")
+    return {"message": "Command sent successfully"}
 
 
 @app.post("/speak")
@@ -535,13 +541,19 @@ async def get_data():
     if age is not None and age > RTM_STALE_S:
         await _rtm_recover(f"state={status.get('state')} reason={status.get('reason')} age={age:.1f}")
     # Headless RTM often returns null after restart while the dashboard tab
-    # still shows "Message from Peer". Rejoin once and retry.
+    # still shows "Message from Peer". Rejoin once and retry, but share the
+    # stale-RTM cooldown: the client polls /data at ~17 Hz, and closing Chrome
+    # on every null poll means the page never gets time to rejoin.
     if data is None:
-        logger.warning("/data got null rtm_data — reinitializing headless browser")
-        try:
-            await browser_service.close_browser()
-        except Exception:
-            pass
+        global _rtm_last_reinit
+        now = time.time()
+        if now - _rtm_last_reinit >= RTM_REINIT_COOLDOWN_S:
+            _rtm_last_reinit = now
+            logger.warning("/data got null rtm_data — reinitializing headless browser")
+            try:
+                await browser_service.close_browser()
+            except Exception:
+                pass
         data = await browser_service.data()
     return JSONResponse(content=data)
 

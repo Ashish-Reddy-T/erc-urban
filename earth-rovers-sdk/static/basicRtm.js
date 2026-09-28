@@ -122,24 +122,31 @@ $(document).ready(function () {
       });
   }
 
-  // Function to send message
-  function sendMessage(json) {
+  // Function to send message. Returns a Promise<boolean> so the Python
+  // /control path can await the peer send instead of always reporting 200.
+  async function sendMessage(json) {
+    if (window.rtm_dead || window.rtm_state === "DISCONNECTED" ||
+        window.rtm_state === "ABORTED") {
+      console.warn("sendMessage skipped: rtm_state=", window.rtm_state,
+                   "dead=", window.rtm_dead);
+      return false;
+    }
     const message = JSON.stringify(json);
     console.warn("sending message to bot", botUid);
     console.warn("message", message);
-    rtmClient
-      .sendMessageToPeer(
+    try {
+      await rtmClient.sendMessageToPeer(
         {
           text: message,
         },
         botUid
-      )
-      .then(() => {
-        console.warn("Message sent successfully:", message);
-      })
-      .catch((err) => {
-        console.warn("Error sending message:", err);
-      });
+      );
+      console.warn("Message sent successfully:", message);
+      return true;
+    } catch (err) {
+      console.warn("Error sending message:", err);
+      return false;
+    }
   }
 
   // Make the function globally accessible
