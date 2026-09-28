@@ -43,8 +43,7 @@ genuine reference trajectory instead of a fixed-command arc, with the same
 safety posture `eval/record.py` already has (tilt / stall / traversability
 abort).
 
-## Assumptions (stated, not asked, per brainstorming-skill rules for this
-task)
+## Assumptions
 
 - Whoever runs this has hands on a keyboard next to the rover or a monitor
   with low-latency video, the same operating conditions `erc_offroad/teleop.py`
