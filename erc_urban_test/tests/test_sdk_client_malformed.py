@@ -129,6 +129,27 @@ def test_bad_yaw_rate_is_none(gz):
     assert tel.hw_ts == pytest.approx(1_700_000_000.0)
 
 
+def test_oversized_int_falls_back_instead_of_raising():
+    # json.loads keeps a too-big integer as int; float() then raises OverflowError,
+    # which is not a ValueError.
+    huge = 10 ** 309
+    tel = _get_data(dict(GOOD, latitude=huge))
+    _check_contract(tel)
+    assert math.isnan(tel.lat)
+    assert tel.lon == pytest.approx(-74.0)
+    assert tel.yaw == pytest.approx(math.pi / 2)
+
+    tel = _get_data(dict(GOOD, gyros=[[0.1, 0.2, huge, 1_700_000_000.0]]))
+    _check_contract(tel)
+    assert tel.yaw_rate is None
+    assert tel.hw_ts == pytest.approx(1_700_000_000.0)
+
+    tel = _get_data(dict(GOOD, rpms=[[huge, 0.0, 0.0, 0.0, 1_700_000_000.0]]))
+    _check_contract(tel)
+    assert tel.wheels_turning is None
+    assert tel.lat == pytest.approx(40.0)
+
+
 @pytest.mark.parametrize("key", list(GOOD))
 def test_nested_null_each_key(key):
     tel = _get_data(dict(GOOD, **{key: None}))

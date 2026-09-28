@@ -150,7 +150,7 @@ class RoverClient:
                 return None
             try:
                 f = float(v)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
             return f if math.isfinite(f) else None
 
@@ -179,7 +179,7 @@ class RoverClient:
         if isinstance(rp, list) and rp and isinstance(rp[-1], list):
             try:
                 wheels = any(abs(float(x)) > 1e-6 for x in rp[-1][:-1])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 wheels = None
 
         return Telemetry(
