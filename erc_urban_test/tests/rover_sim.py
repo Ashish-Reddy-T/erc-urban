@@ -189,7 +189,7 @@ class RoverSim:
         return {
             "battery": self.cfg.battery,
             "signal_level": 5,
-            "orientation": round(self.reported_orientation(), 2),
+            "orientation": round(self.reported_orientation(), 2) % 360.0,
             "lamp": 0,
             "speed": round(abs(self.speed_mps), 3),
             "gps_signal": 31.25 if self.cfg.gps_fix else 0.0,

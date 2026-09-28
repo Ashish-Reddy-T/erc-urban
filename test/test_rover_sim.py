@@ -78,6 +78,16 @@ class TestKinematics(unittest.TestCase):
         self.assertLess(o, 360.0)
         self.assertAlmostEqual(o, 360.0 - 31.0, places=1)
 
+    def test_orientation_round_does_not_report_360(self):
+        # 0.004 deg left of north is 359.996, which rounds to 360.00.
+        sim = RoverSim(SimConfig(orientation_delay_s=0.0, orientation_period_s=0.0), seed=1)
+        sim.command(0.0, 0.4)
+        sim.step(0.004 / 31.0)
+        o = sim.data()["orientation"]
+        self.assertGreaterEqual(o, 0.0)
+        self.assertLess(o, 360.0)
+        self.assertAlmostEqual(o, 0.0, places=2)
+
     def test_arc_integration_closes_full_circle(self):
         sim = RoverSim(seed=1)
         sim.command(0.5, 0.4)
