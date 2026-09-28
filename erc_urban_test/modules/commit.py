@@ -70,10 +70,13 @@ class CommitWindow:
         R = np.array([[c, -s], [s, c]])
         self.path = (self.path - np.array([delta.dx, delta.dy])) @ R.T
         self.distance_m += delta.distance_m
-        # Drop waypoints the rover has already driven past.
+        # Drop waypoints the rover has already driven past. If every waypoint
+        # has fallen behind, this must also drop them (path becomes empty and
+        # `active` goes False), not silently keep the stale, now-behind path:
+        # `active` only checks length, so a stale full path would stay
+        # "active" and get blended into the next offer() instead of expiring.
         keep = self.path[:, 0] > 0.0
-        if keep.any():
-            self.path = self.path[keep]
+        self.path = self.path[keep]
 
     def expired(self) -> bool:
         return (
