@@ -26,7 +26,7 @@ The bug: when a tick raises (e.g. the SDK is unreachable), `main()`'s `except Ex
 
 ## Review Focus
 
-1. **Halt-after-tick-error double fault.** When the SDK is unreachable, `main()`'s `except Exception` handler calls `_halt(client)`, which today calls `client.send_cmd(...)` unguarded — a second network failure there raises out of the handler and kills the whole run with the rover's last command still standing. Task 1's tests pin that `send_cmd` returns `False` rather than raising on `ConnectionError`/`Timeout`.
+1. **Halt-after-tick-error double fault.** When the SDK is unreachable, `main()`'s `except Exception` handler calls `_halt(client)`, which today calls `client.send_cmd(...)` unguarded — a second network failure there raises out of the handler and kills the whole run without an explicit stop ever being sent. Task 1's tests pin that `send_cmd` returns `False` rather than raising on `ConnectionError`/`Timeout`.
 2. **Silent halt failure.** Simply swallowing the failure (`send_cmd` returns `False` and the caller does nothing) hides from the operator that the rover was *not* actually told to stop. Task 2's tests pin that `_halt` prints a visible warning when the stop itself fails to send, and that the routine per-tick `_cmd` path is unaffected (no warning spam on ordinary transient misses).
 3. **Server-side failure without a raised exception.** `/control` can answer with a 5xx (e.g. the 503 added by PR #27's rate-limit path on the SDK side) without `requests.post` raising at all. A bare `try/except RequestException` would miss this silently (report success on a failed command). Task 1's test pins that a mocked 5xx response is also treated as failure.
 4. **Backward compatibility of existing callers.** `stop()`, `_cmd`, the final `client.send_cmd(0.0, 0.0, lamp=0)` in `main()`, `eval/record.py` (lines 114 and 161, both packages) and `erc_urban_test/bench.py` (lines 84, 86 and 226) all currently ignore `send_cmd`'s return value; changing it from `None` to `bool` must not break them. They do rely on the raise, though: today a `/control` `ConnectionError` inside `_cmd` aborts the tick and prints `tick error:`, and in `record.py` it ends the recording. After Task 1 those failures are silent unless the caller checks the return value, so decide per caller whether that is acceptable. Task 1 re-runs the existing `test_send_cmd_clamps` test unmodified as a regression check, and Task 2 adds an explicit test that `_cmd` still works when `send_cmd` returns `False`.
@@ -100,8 +100,8 @@ Replace `erc_urban_test/sdk_client.py:65-76`:
         network failure (timeout, connection refused, 5xx) rather than
         raising. main()'s tick-error handler calls this (via _halt) to stop
         the rover after a tick has already failed; a raise here would escape
-        that handler uncaught and end the run with the rover's last
-        (possibly nonzero) command still standing.
+        that handler uncaught and end the run with no stop ever sent,
+        leaving the rover to coast until its firmware watchdog fires.
         """
         linear = float(np.clip(linear, -1.0, 1.0))
         angular = float(np.clip(angular, -1.0, 1.0))
