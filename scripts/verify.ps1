@@ -98,6 +98,14 @@ try {
         if ($LASTEXITCODE -ne 0) { $fail = $true }
         & git diff --cached --check
         if ($LASTEXITCODE -ne 0) { $fail = $true }
+        # Committed changes on this branch, which the two checks above never see.
+        & git rev-parse --verify -q $BaseRef *> $null
+        if ($LASTEXITCODE -eq 0) {
+            & git diff --check "$BaseRef...HEAD"
+            if ($LASTEXITCODE -ne 0) { $fail = $true }
+        } else {
+            Write-Host "skip committed check: base ref '$BaseRef' not found (pass -BaseRef <ref>)"
+        }
     } else {
         Write-Host "skip: not a git checkout"
     }

@@ -94,6 +94,14 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
   if ! git diff --cached --check; then
     fail=1
   fi
+  # Committed changes on this branch, which the two checks above never see.
+  if git rev-parse --verify -q "$BASE_REF" >/dev/null 2>&1; then
+    if ! git diff --check "$BASE_REF"...HEAD; then
+      fail=1
+    fi
+  else
+    echo "skip committed check: base ref '$BASE_REF' not found (set BASE_REF=<ref>)"
+  fi
 else
   echo "skip: not a git checkout"
 fi
