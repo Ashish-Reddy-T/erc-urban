@@ -123,6 +123,15 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests
 
 `test_live_sdk.py` needs the SDK running with a rover connected.
 
+## Not in git
+
+| What | Size | Where it comes from |
+|---|---|---|
+| Model checkpoints (`*.pth`) | ~510 MB | `setup.sh` |
+| `erc_indoor/data/indoor_track_recording.h5` (day teach lap) | 509 MB | Ashish; only to rebuild the route map |
+| `runs/` (run logs, night teach lap) | GBs | local output |
+| `data/` (FrodoBots rides for offline eval), `repos/` (upstream paper code) | — | reference material only |
+
 ## Contributing
 
 - **Branch names**: `<type>/<short-topic>`, e.g. `fix/urban-depth-turn-sign`,
@@ -142,12 +151,3 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests
   - Don't commit `.env`, API tokens, model checkpoints, or `runs/` output.
   - Use the PR template (`.github/pull_request_template.md`) — it has the
     same checklist as this section.
-
-## Not in git
-
-| What | Size | Where it comes from |
-|---|---|---|
-| Model checkpoints (`*.pth`) | ~510 MB | `setup.sh` |
-| `erc_indoor/data/indoor_track_recording.h5` (day teach lap) | 509 MB | Ashish; only to rebuild the route map |
-| `runs/` (run logs, night teach lap) | GBs | local output |
-| `data/` (FrodoBots rides for offline eval), `repos/` (upstream paper code) | — | reference material only |
