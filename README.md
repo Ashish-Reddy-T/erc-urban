@@ -131,3 +131,23 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests
 | `erc_indoor/data/indoor_track_recording.h5` (day teach lap) | 509 MB | Ashish; only to rebuild the route map |
 | `runs/` (run logs, night teach lap) | GBs | local output |
 | `data/` (FrodoBots rides for offline eval), `repos/` (upstream paper code) | — | reference material only |
+
+## Contributing
+
+- **Branch names**: `<type>/<short-topic>`, e.g. `fix/urban-depth-turn-sign`,
+  `feat/action-chunk-latency`, `test/rover-sim`. `<type>` matches the commit
+  types below; `<short-topic>` is a few hyphenated words, no issue numbers.
+- **Commits**: [Conventional Commits](https://www.conventionalcommits.org/),
+  `type(scope): summary` — `fix(urban): ...`, `feat(indoor): ...`,
+  `test(sdk): ...`, `perf(urban): ...`, `docs: ...`, `chore: ...`,
+  `refactor: ...`. Scope is the stack (`urban`, `indoor`, `offroad`, `sdk`)
+  when the change is stack-specific. One logical change per commit.
+- **Before opening a PR**:
+  - Run both test suites (see [Tests](#tests) above) and make sure nothing
+    that passed before your change now fails.
+  - If you changed `erc_urban`, check whether `erc_urban_test` has the same
+    code path and mirror the fix there (and vice versa) — they drift apart
+    otherwise.
+  - Don't commit `.env`, API tokens, model checkpoints, or `runs/` output.
+  - Use the PR template (`.github/pull_request_template.md`) — it has the
+    same checklist as this section.

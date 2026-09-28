@@ -26,6 +26,10 @@ __pycache__/
 .venv/
 venv/
 
+# Linked worktrees created by scripts/new-worktree.sh|ps1 (see CONTRIBUTING.md)
+.worktrees/
+worktrees/
+
 # The team shares one FrodoBots key, so earth-rovers-sdk/.env is tracked on
 # purpose. Keep the repo private. Vertex AI keys stay out.
 *-service-account.json

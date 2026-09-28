@@ -1,0 +1,19 @@
+#   pip install ruff && ruff check .
+#
+# Minimal lint gate: nothing enforces even syntax correctness before a PR
+# lands (see erc-urban#24 for the offline test CI, which does not run a
+# linter). This adds just enough to fail loudly on the bugs ruff's own rule
+# classes treat as build-breaking rather than stylistic: syntax errors and
+# undefined names.
+#
+# Deliberately not enabling the full default rule set (unused imports,
+# import sorting, etc.): that needs a repo-wide cleanup first and is out of
+# scope here. E9/F63/F7/F82 are already clean on this tree.
+target-version = "py310"
+extend-exclude = [
+    "ERC-3-earthrover-challenge",  # vendored snapshot, not our code
+    ".osm_cache",
+]
+
+[lint]
+select = ["E9", "F63", "F7", "F82"]
