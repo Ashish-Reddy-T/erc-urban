@@ -492,6 +492,16 @@ class Navigator:
                 self._avoid_phase = "pass"
                 self._pass_end = obs.now + CONE_PASS_S
             if obs.now < self._pass_end:
+                # The pass drives blind for CONE_PASS_S otherwise: after the
+                # sidestep the rover can be facing a wall or a table leg.
+                # Same stop rule as DRIVE.
+                fs = (self.free.estimate(obs.frame)
+                      if self.free is not None and obs.frame is not None else None)
+                if fs is not None:
+                    self.last_fs = (fs, obs.now)
+                    self.log.ahead_m = fs.ahead_m
+                    if fs.ahead_m < STOP_M:
+                        return self._begin_escape(obs, f"floor ends {fs.ahead_m:.2f} m ahead while passing cone")
                 return Cmd(CONE_PASS_LIN, 0.0, min(0.6, self._pass_end - obs.now), "AVOID", "passing cone")
             self.mode = "DRIVE"
             self._e_f = self._c_f = None
@@ -683,6 +693,7 @@ class Navigator:
         self._prog_hist = []
         self._escape_phase = "stop"
         self._escape_until = obs.now + ESCAPE_SETTLE_S
+        self._force_reverse = force_reverse
         self._escapes += 1
         self._e_f = self._c_f = None
         self._i_term, self._i_t = 0.0, None
@@ -723,7 +734,9 @@ class Navigator:
         lo, hi = -ESCAPE_MAX_SWING_DEG - swung, ESCAPE_MAX_SWING_DEG - swung
         want = float(np.clip(want, lo, hi))
 
-        if fs.ahead_m >= NEED_M and abs(want) < 10:
+        # A hung-up rover can see clear floor while facing the route; that is
+        # exactly when the forced reverse has to win over "clear, drive on".
+        if fs.ahead_m >= NEED_M and abs(want) < 10 and not self._force_reverse:
             self.mode = "DRIVE"
             self._move_ref = None
             return Cmd(0.0, 0.0, 0.3, "DRIVE", f"escape done, {fs.ahead_m:.1f} m clear")
