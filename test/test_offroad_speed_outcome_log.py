@@ -48,7 +48,11 @@ class TestOffroadOutcomeRecord:
 
     def test_record_is_json_serializable(self):
         import json
+        # correlate() returns NaN when a screenshot is missing. json.dumps
+        # writes a bare NaN token by default, which strict JSON readers
+        # reject, so the record must carry None and survive allow_nan=False.
         rec = outcome_record(tick=1, ok=True, wedged=False, reason=None,
-                              d_yaw=4.0, corr=0.1, pitch=2.0, lin=0.30,
+                              d_yaw=4.0, corr=float("nan"), pitch=2.0, lin=0.30,
                               action="turn")
-        json.dumps(rec)  # must not raise (NaN corr is the one thing to watch)
+        assert rec["corr"] is None
+        assert json.loads(json.dumps(rec, allow_nan=False))["corr"] is None
