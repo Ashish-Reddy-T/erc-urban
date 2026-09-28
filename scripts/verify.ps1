@@ -68,7 +68,9 @@ try {
             $committed = & git diff --name-only "$BaseRef...HEAD" -- erc_urban erc_urban_test
             $unstaged  = & git diff --name-only -- erc_urban erc_urban_test
             $staged    = & git diff --cached --name-only -- erc_urban erc_urban_test
-            $changed = @($committed + $unstaged + $staged | Where-Object { $_ } | Sort-Object -Unique)
+            # @() each one first: a single-line git output is a scalar string,
+            # and "a" + "b" concatenates instead of building a list.
+            $changed = @(@($committed) + @($unstaged) + @($staged) | Where-Object { $_ } | Sort-Object -Unique)
             $drift = $false
             foreach ($path in $changed) {
                 if ($path -like "erc_urban/*") {
