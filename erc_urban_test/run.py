@@ -6,6 +6,9 @@ Main control loop. This is the file you actually execute.
 
 Mission mode (default): start mission -> drive checkpoints -> /checkpoint-reached.
 Free-drive: USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban_test.run
+Dry run (perceive + plan + log, no motion, no mission POSTs):
+    SEND_CONTROL=0 python -m erc_urban_test.run
+    SEND_CONTROL=0 USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban_test.run
 
 Older earth-rovers-sdk builds have no /status or /missions; neither is required.
 """
@@ -46,6 +49,11 @@ USE_OBS_STOP = os.environ.get("USE_OBS_STOP", "1") != "0"
 # Metric depth clearance. Falls back silently if the checkpoint is missing.
 USE_DEPTH = os.environ.get("USE_DEPTH", "1") != "0"
 LAMP = int(os.environ.get("LAMP", "1"))
+# SEND_CONTROL=0: dry run. _cmd/_halt become no-ops so the rover never moves,
+# and _start_mission/_claim skip their POSTs so a dry run cannot start or
+# score a real mission (GET /checkpoints still runs). The loop still
+# perceives, plans and logs. Same flag as erc_indoor.run.
+SEND_CONTROL = os.environ.get("SEND_CONTROL", "1") != "0"
 # Only STOP to pivot for large errors: a stop-and-settle cycle costs ~3 s, so
 # anything steerable while rolling should be steered.
 ALIGN_DEG = float(os.environ.get("ALIGN_DEG", "65"))
@@ -409,11 +417,29 @@ def _note_blocked(reason: str = "") -> None:
 
 
 def _cmd(client: RoverClient, lin: float, ang: float) -> None:
+    if not SEND_CONTROL:
+        return
     client.send_cmd(lin, ang, lamp=LAMP)
 
 
 def _halt(client: RoverClient) -> None:
+    if not SEND_CONTROL:
+        return
     client.send_cmd(0.0, 0.0, lamp=LAMP)
+
+
+def _start_mission(client: RoverClient) -> dict:
+    if not SEND_CONTROL:
+        print("SEND_CONTROL=0: skipping POST /start-mission (dry run)")
+        return {"message": "dry run: start-mission skipped"}
+    return client.start_mission()
+
+
+def _claim(client: RoverClient) -> dict:
+    if not SEND_CONTROL:
+        print("SEND_CONTROL=0: skipping POST /checkpoint-reached (dry run)")
+        return {"message": "dry run: checkpoint-reached skipped"}
+    return client.checkpoint_reached()
 
 
 def _align_cmd(bearing: float) -> tuple[float, float]:
@@ -600,7 +626,7 @@ def resolve_goals(
         try:
             if os.environ.get("SKIP_START_MISSION", "0") == "0":
                 print("starting mission...")
-                started = client.start_mission()
+                started = _start_mission(client)
                 print("start-mission ok:", started.get("message", started))
             cps, latest = client.get_checkpoints()
             remaining = [c for c in cps if c.sequence > latest]
@@ -669,10 +695,55 @@ def _wrap_rad(a: float) -> float:
     return float((a + np.pi) % (2 * np.pi) - np.pi)
 
 
+def depth_turn_to_wp(turn_rad: float, scale: float) -> tuple[float, float]:
+    """Map ERC-3 depth turn_rad to a robot-frame (x_fwd, y_left) waypoint.
+
+    ERC-3 outdoor_traversability yaw bins are image-right-positive
+    (arctan((u-cx)/fx)); erc_urban waypoints are left-positive (y = sin).
+    Negate at this urban boundary rather than forking ERC-3.
+    """
+    turn = -float(turn_rad)
+    x = max(0.15, abs(float(np.cos(turn))) * float(scale))
+    y = float(np.sin(turn)) * float(scale)
+    return x, y
+
+
+def depth_evaluate(dg, front, bearing: float):
+    """Run the depth gate with a left-positive robot-frame goal bearing.
+
+    OutdoorTraversability picks the open yaw bin closest to the goal, and its
+    bins are right-positive, so the bearing is negated going in just as
+    turn_rad is negated coming out. Without this the gate prefers the open
+    gap on the mirror side of the goal.
+    """
+    return dg.evaluate(front, -float(bearing))
+
+
 def _reverse_ticks() -> tuple[int, str]:
     if _REAR_SEEN:
         return REVERSE_TICKS, ""
     return REVERSE_TICKS_BLIND, " [BLIND: no rear camera — short nudge only]"
+
+
+def depth_override_command(controller, wp, point, scale: float) -> tuple[float, float]:
+    """Steer toward a depth-avoid point instead of the planner's first waypoint.
+
+    point: robot-frame (x_fwd, y_left) override direction, already left-positive.
+    scale: depth gate linear_scale, clamped by the caller.
+
+    Pure pursuit ignores waypoints closer than its lookahead and its speed does
+    not depend on waypoint distance, so the point is pushed out to the
+    lookahead along its own direction and `scale` is applied to the speed.
+    """
+    x, y = float(point[0]), float(point[1])
+    r = float(np.hypot(x, y))
+    reach = float(controller.lookahead_m) * (1.0 + 1e-6)
+    if 0.0 < r < reach:
+        x, y = x * reach / r, y * reach / r
+    wp = wp.copy()
+    wp[0, 0], wp[0, 1] = x, y
+    lin, ang = controller.command(wp)
+    return float(lin * scale), ang
 
 
 # Prefer turning around to reversing: a 180 deg turn makes a blind manoeuvre a
@@ -835,6 +906,32 @@ def _begin_pivot(stuck_state: dict, reason: str) -> None:
     )
 
 
+# Telemetry freshness. The SDK adds rtm_age_s (age of the last RTM peer
+# message, on the SDK host clock, so no rover/laptop skew) and rtm_state (the
+# Agora connection state) to every /data payload. When the session is ABORTED
+# (REMOTE_LOGIN: someone else connected) or the last peer message is older than
+# the SDK's own RTM_STALE_S (6 s, earth-rovers-sdk/main.py), lat/lon/yaw are a
+# frozen copy and steering on them is driving blind. Older SDK builds omit
+# both keys; the gate is then a no-op.
+TELEM_STALE_S = float(os.environ.get("TELEM_STALE_S", "6"))
+_RTM_DEAD_STATES = frozenset({"ABORTED", "DISCONNECTED", "TOKEN_EXPIRED"})
+
+
+def _telemetry_dead(tel) -> str | None:
+    """Reason string when this tick's telemetry must not be driven on."""
+    raw = tel.raw if isinstance(tel.raw, dict) else {}
+    state = raw.get("rtm_state")
+    if state in _RTM_DEAD_STATES:
+        return f"rtm_state={state} reason={raw.get('rtm_reason')}"
+    try:
+        age = float(raw.get("rtm_age_s"))
+    except (TypeError, ValueError):
+        return None
+    if age > TELEM_STALE_S:
+        return f"rtm_age_s={age:.1f}"
+    return None
+
+
 def step(client, planner, controller, goal,
          mission_mode: bool, stuck_state: dict | None = None,
          route_profile=None, goal_index: int = 0) -> bool:
@@ -846,6 +943,11 @@ def step(client, planner, controller, goal,
     if rear is not None:
         _REAR_SEEN = True
     tel = client.get_data()
+    dead = _telemetry_dead(tel)
+    if dead is not None:
+        _halt(client)
+        print(f"telemetry stale ({dead}): holding still", flush=True)
+        return False
 
     if np.isnan(tel.lat) or np.isnan(tel.lon):
         return False
@@ -880,7 +982,7 @@ def step(client, planner, controller, goal,
         _halt(client)
         if not mission_mode:
             return True
-        resp = client.checkpoint_reached()
+        resp = _claim(client)
         if resp.get("_http_status", 200) >= 400:
             print(f"checkpoint-reached rejected (rng={rng:.1f}m): {resp}")
             return False
@@ -907,7 +1009,7 @@ def step(client, planner, controller, goal,
     depth_view = None
     dg = _depth_gate()
     if dg is not None:
-        depth_view = dg.evaluate(front, bearing)
+        depth_view = depth_evaluate(dg, front, bearing)
 
     # Ground-relative costmap, reusing the depth map just computed. Unlike the
     # fixed-band clearance it sees low, close obstacles in the bottom of the
@@ -1696,10 +1798,13 @@ def step(client, planner, controller, goal,
         # Depth safety: override the first waypoint if clearance is bad.
         if depth_view is not None and depth_view.turn_rad is not None and not depth_view.blocked:
             scale = max(0.25, float(depth_view.linear_scale))
-            wp = wp.copy()
-            wp[0, 0] = max(0.15, abs(np.cos(depth_view.turn_rad)) * scale)
-            wp[0, 1] = np.sin(depth_view.turn_rad) * scale
-        lin, ang = controller.command(wp)
+            # ERC-3 turn_rad is right-positive; depth_turn_to_wp converts to left-positive.
+            point = depth_turn_to_wp(depth_view.turn_rad, scale)
+            lin, ang = depth_override_command(controller, wp, point, scale)
+            depth_scaled = True
+        else:
+            lin, ang = controller.command(wp)
+            depth_scaled = False
         # Reuses the `pre_aim` computed above the stop gates rather than
         # calling align() again with identical arguments: one aim per tick means
         # the gates, the pivot decision and the steering command can never
@@ -1747,7 +1852,8 @@ def step(client, planner, controller, goal,
         # correctly-scaled depth the gate reads the ground and returns
         # linear_scale=0.0, zeroing the throttle on open pavement. Let it slow
         # the rover only when the costmap is unavailable.
-        if cm_res is None and depth_view is not None and depth_view.linear_scale < 1.0:
+        if (cm_res is None and not depth_scaled and depth_view is not None
+                and depth_view.linear_scale < 1.0):
             lin = float(lin * depth_view.linear_scale)
         # Decelerate into COSTMAP_STOP_M, so the stop is reached at a speed the
         # dead time can absorb.
@@ -1807,7 +1913,8 @@ def main():
         f"planner={type(planner).__name__} ready={ready} "
         f"USE_OBS_STOP={USE_OBS_STOP} USE_DEPTH={USE_DEPTH} "
         f"USE_LOCALMAP={USE_LOCALMAP} USE_EXPLORE={USE_EXPLORE} "
-        f"LAMP={'on' if LAMP else 'off'}"
+        f"LAMP={'on' if LAMP else 'off'} "
+        f"SEND_CONTROL={SEND_CONTROL}"
     )
     wait_for_sdk(client)
     dg = _depth_gate()
@@ -1839,7 +1946,7 @@ def main():
             print(f"already within 15 m of {goal} — claiming without driving")
             _halt(client)
             if mission_mode:
-                resp = client.checkpoint_reached()
+                resp = _claim(client)
                 print(f"checkpoint-reached: {resp}")
                 if resp.get("_http_status", 200) >= 400:
                     print("claim failed; will drive carefully")
