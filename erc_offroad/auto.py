@@ -136,6 +136,31 @@ def _wedged(d_yaw: float, corr: float, moved: bool, was_turn: bool) -> bool:
     return (not math.isnan(corr)) and corr > CORR_SAME
 
 
+def outcome_record(tick: int, ok: bool, wedged: bool, reason: Optional[str],
+                    d_yaw: float, corr: float, pitch: float, lin: float,
+                    action: str) -> dict:
+    """
+    Classify one tick's result for the structured log, so a completed run's
+    auto_log.jsonl can be filtered on "was this a climbing tick, and what
+    happened" without re-parsing console output. See issue #9: the question
+    of whether the unconditional 1.25x climbing boost in
+    terrain.speed_policy is redundant with climb.py's escalation gate is a
+    measurement question, and this is the measurement -- no behavior change.
+    """
+    if not ok:
+        outcome = "abort"
+    elif wedged:
+        outcome = "wedged"
+    else:
+        outcome = "ok"
+    corr_v = corr if (isinstance(corr, float) and not math.isnan(corr)) else None
+    return {
+        "event": "outcome", "tick": tick, "outcome": outcome, "reason": reason,
+        "d_yaw": d_yaw, "corr": corr_v, "pitch": pitch, "lin": lin,
+        "action": action,
+    }
+
+
 def recovery_side(tv: Optional[TerrainView], last: float) -> float:
     """
     Which way to turn during back-and-fill. Returns +1 (right) or -1 (left).
@@ -282,12 +307,18 @@ def main(argv=None) -> int:
             print(f"    turn rate now ~{turn_rate:.1f} deg/s "
                   f"(this burst {measured:.1f})")
 
+        wedged = ok and _wedged(d_yaw, corr, moved, d.action == "turn")
+        log.write(json.dumps(outcome_record(
+            tick, ok, wedged, (reason if not ok else None), d_yaw, corr,
+            att.pitch, d.lin, d.action)) + "\n")
+        log.flush()
+
         if not ok:
             consec_fail += 1
             print(f"    guard: {reason}")
             last_side = recovery_side(tv, last_side)
             back_and_fill(log, last_side)
-        elif _wedged(d_yaw, corr, moved, d.action == "turn"):
+        elif wedged:
             consec_fail += 1
             print(f"    WEDGED (dyaw {d_yaw:+.0f}, corr {corr:+.2f}) - "
                   "back-and-fill, NOT more throttle")
