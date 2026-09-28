@@ -12,7 +12,7 @@ Modelled live facts (all configurable through ``SimConfig``):
     the true heading as of ``orientation_delay_s`` (1.4 s) ago, sampled and
     held on an ``orientation_period_s`` (0.4 s) grid.
   * gyros rows are ``[x, y, z, t]``, z = yaw rate in deg/s, LEFT-positive,
-    scaled by a gain error (seeded uniform in [0.85, 1.15] unless given).
+    scaled by a gain error (seeded uniform in [0.75, 1.25] unless given).
   * GPS carries Gaussian noise in metres, redrawn every ``gps_period_s``;
     with no fix latitude and longitude read 1000.
 
@@ -62,7 +62,7 @@ class SimConfig:
     wheel_circumference_m: float = 0.388
     orientation_delay_s: float = 1.4
     orientation_period_s: float = 0.4
-    # None = seeded uniform draw in [0.85, 1.15].
+    # None = seeded uniform draw in [0.75, 1.25].
     gyro_gain: Optional[float] = None
     gyro_bias_dps: float = 0.0
     gyro_noise_dps: float = 0.0
@@ -82,7 +82,7 @@ class RoverSim:
         root = np.random.default_rng(seed)
         self._rng_gyro, self._rng_gps = (np.random.default_rng(s) for s in root.integers(0, 2**63, size=2))
         self.gyro_gain = (float(self.cfg.gyro_gain) if self.cfg.gyro_gain is not None
-                          else float(root.uniform(0.85, 1.15)))
+                          else float(root.uniform(0.75, 1.25)))
         self.t = 0.0
         self.x = 0.0
         self.y = 0.0

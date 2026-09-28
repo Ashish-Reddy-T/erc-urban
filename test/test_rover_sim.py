@@ -159,8 +159,8 @@ class TestGyro(unittest.TestCase):
     def test_gyro_integral_within_25_percent(self):
         for seed in range(20):
             sim = RoverSim(seed=seed)
-            self.assertGreaterEqual(sim.gyro_gain, 0.85)
-            self.assertLessEqual(sim.gyro_gain, 1.15)
+            self.assertGreaterEqual(sim.gyro_gain, 0.75)
+            self.assertLessEqual(sim.gyro_gain, 1.25)
             sim.command(0.0, 0.4)
             seen, integral = set(), 0.0
             for _ in range(60):
@@ -170,11 +170,27 @@ class TestGyro(unittest.TestCase):
                         seen.add(r[3])
                         integral += r[2] * sim.cfg.imu_period_s
             truth = 31.0 * sim.t
-            self.assertLess(abs(integral / truth - 1.0), 0.25, msg=f"seed {seed}")
+            self.assertLessEqual(abs(integral / truth - 1.0), 0.25, msg=f"seed {seed}")
 
     def test_gyro_gain_seeded(self):
         self.assertEqual(RoverSim(seed=7).gyro_gain, RoverSim(seed=7).gyro_gain)
         self.assertNotEqual(RoverSim(seed=7).gyro_gain, RoverSim(seed=8).gyro_gain)
+
+    def test_default_gyro_gain_reaches_live_worst_case(self):
+        gains = [RoverSim(seed=s).gyro_gain for s in range(200)]
+        self.assertGreaterEqual(min(gains), 0.75)
+        self.assertLessEqual(max(gains), 1.25)
+        # The old [0.85, 1.15] draw never reaches a 25 percent scale error.
+        self.assertLess(min(gains), 0.85)
+        self.assertGreater(max(gains), 1.15)
+
+    def test_explicit_gyro_gain_extremes_scale_yaw_rate(self):
+        for gain in (0.75, 1.25):
+            sim = RoverSim(SimConfig(gyro_gain=gain), seed=1)
+            sim.command(0.0, 0.4)
+            _run(sim, 1.0)
+            for row in sim.data()["gyros"]:
+                self.assertAlmostEqual(row[2], 31.0 * gain, places=3)
 
 
 class TestGps(unittest.TestCase):
