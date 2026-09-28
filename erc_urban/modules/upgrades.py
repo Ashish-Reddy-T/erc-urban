@@ -152,10 +152,14 @@ class PoseBuffer:
         if p0 is None or p1 is None:
             return waypoints
         dx, dy = p1[1] - p0[1], p1[2] - p0[2]
+        # The travel is in odom axes; the waypoints are in the capture-time
+        # robot frame, so express the travel in that frame before subtracting.
+        c0, s0 = np.cos(p0[3]), np.sin(p0[3])
+        tx, ty = c0 * dx + s0 * dy, -s0 * dx + c0 * dy
         dyaw = _wrap(p1[3] - p0[3])
         c, s = np.cos(-dyaw), np.sin(-dyaw)
         R = np.array([[c, -s], [s, c]])
-        shifted = waypoints - np.array([dx, dy])
+        shifted = waypoints - np.array([tx, ty])
         return shifted @ R.T
 
     def _nearest(self, t):
