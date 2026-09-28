@@ -6,7 +6,7 @@
 
 **Architecture:** `send_cmd` wraps its `/control` POST in a `try/except requests.exceptions.RequestException` and also treats any 5xx response as failure, returning `bool` instead of `None` and never raising. `_halt()` in `run.py` checks that return value and prints a visible warning when the stop itself failed to send, instead of silently swallowing it. Both `erc_urban` and `erc_urban_test` carry duplicate copies of `sdk_client.py` and `run.py`, so the same two edits land in both packages.
 
-**Tech Stack:** Python 3, `requests`, `unittest`/`pytest`, run through the Windows `rover_env` interpreter via WSL interop (`test.sh`). No new dependencies.
+**Tech Stack:** Python 3, `requests`, `unittest`/`pytest`. No new dependencies.
 
 **Spec:** none — this plan documents a defect found directly in the code, not from a written spec. Cited locations, current worktree HEAD `6bd2577` (verified 2026-09-28):
 - `erc_urban/sdk_client.py:65-76` (`send_cmd`, unguarded `requests.post`)
@@ -18,12 +18,11 @@ The bug: when a tick raises (e.g. the SDK is unreachable), `main()`'s `except Ex
 
 ## Global Constraints
 
-- Git via `git.exe` only (Windows git); never Linux `git`. LF line endings. Conventional commit messages (`fix:`/`feat:`/`test:`/`docs:`/`chore:`/`refactor:`). Never amend, rebase, force-push, or push.
-- Any change to `erc_urban` must be mirrored into `erc_urban_test`, and vice versa, when the other copy carries the same code (both `sdk_client.py` and `run.py` do here).
-- Tests run only via `bash /mnt/c/Users/007ha/Desktop/self-drive/.agents/sp_lanes/test.sh writing-plans`, which runs `test/` (`--ignore=test/test_live_sdk.py`) and `erc_urban_test/tests`. Both suites must be no worse after the change. Baseline measured 2026-09-28: `test/` 286 passed, 1 skipped; `erc_urban_test/tests` 273 passed, 3 skipped.
-- Keep the change small and reviewable (well under 400 changed lines — this is a ~20-line fix duplicated across two packages plus tests).
-- `erc_urban` has no `tests/` directory and `test.sh` runs no suite against it; verification there is by equivalence against the already-tested `erc_urban_test` copy plus an import smoke check, not by a second pytest run.
-- Never touch `nyu-earthrover`, never edit or print any `.env` file, never load model weights for benchmarks.
+- LF line endings. Conventional commit messages (`fix:`/`feat:`/`test:`/`docs:`/`chore:`/`refactor:`).
+- Any change to `erc_urban` must be mirrored into `erc_urban_test`, and vice versa, when the other copy carries the same code (both `sdk_client.py` and `run.py` do here). Tests are mirrored the same way: `test/` is the `erc_urban` suite, `erc_urban_test/tests/` is the `erc_urban_test` suite, same test bodies with the import swapped.
+- Run both offline suites before and after: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test --ignore=test/test_live_sdk.py` and `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests`. Both must be no worse after the change. Baseline at `6bd2577`: `test/` 286 passed, 1 skipped; `erc_urban_test/tests` 273 passed, 3 skipped.
+- Keep the change small and reviewable (well under 400 changed lines; this is a ~20-line fix duplicated across two packages plus tests).
+- Never edit or print any `.env` file.
 
 ## Review Focus
 
@@ -86,7 +85,7 @@ class TestSendCmdResilience(unittest.TestCase):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `/mnt/c/Users/007ha/miniforge3/envs/rover_env/python.exe -m pytest -q erc_urban_test/tests/test_sdk_client.py -k TestSendCmdResilience -v`
+Run: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q erc_urban_test/tests/test_sdk_client.py -k TestSendCmdResilience -v`
 Expected: FAIL/ERROR on all four — `send_cmd` today always returns `None` (`assertIs(None, True)` and `assertIs(None, False)` both fail), and the connection-error/timeout cases raise straight out of `send_cmd` (reported as ERROR, not FAIL, since nothing catches them yet).
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -122,14 +121,14 @@ Replace `erc_urban_test/sdk_client.py:65-76`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `/mnt/c/Users/007ha/miniforge3/envs/rover_env/python.exe -m pytest -q erc_urban_test/tests/test_sdk_client.py -v`
+Run: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q erc_urban_test/tests/test_sdk_client.py -v`
 Expected: PASS — all four new tests green, plus the pre-existing `test_send_cmd_clamps` still green (it never inspects `send_cmd`'s return value, so the `None -> bool` change is invisible to it).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git.exe add erc_urban_test/sdk_client.py erc_urban_test/tests/test_sdk_client.py
-git.exe commit -m "fix(urban-test): send_cmd reports network failure instead of raising"
+git add erc_urban_test/sdk_client.py erc_urban_test/tests/test_sdk_client.py
+git commit -m "fix(urban-test): send_cmd reports network failure instead of raising"
 ```
 
 ### Task 2: `_halt()` surfaces a failed stop command instead of swallowing it (erc_urban_test)
@@ -195,7 +194,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `/mnt/c/Users/007ha/miniforge3/envs/rover_env/python.exe -m pytest -q erc_urban_test/tests/test_control_resilience.py -v`
+Run: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q erc_urban_test/tests/test_control_resilience.py -v`
 Expected: `test_halt_prints_warning_when_send_fails` FAILS (`buf.getvalue()` is `""` today — `_halt` ignores `send_cmd`'s return value and never prints). The other two tests already pass against today's `_halt`/`_cmd` (they don't raise given a mock), which is fine — they exist to lock the behavior in place once Task 2 lands, not to prove a second bug.
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -210,64 +209,61 @@ def _halt(client: RoverClient) -> None:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `/mnt/c/Users/007ha/miniforge3/envs/rover_env/python.exe -m pytest -q erc_urban_test/tests/test_control_resilience.py -v`
+Run: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q erc_urban_test/tests/test_control_resilience.py -v`
 Expected: PASS — 3 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git.exe add erc_urban_test/run.py erc_urban_test/tests/test_control_resilience.py
-git.exe commit -m "fix(urban-test): warn when a halt command fails to send"
+git add erc_urban_test/run.py erc_urban_test/tests/test_control_resilience.py
+git commit -m "fix(urban-test): warn when a halt command fails to send"
 ```
 
-### Task 3: mirror both fixes into `erc_urban` (no test suite there — verified by equivalence + import)
+### Task 3: mirror both fixes and their tests into `erc_urban`
 
 **Files:**
-- Modify: `erc_urban/sdk_client.py:65-76` (`send_cmd`) — same body as Task 1, under the `erc_urban` package.
-- Modify: `erc_urban/run.py:427-428` (`_halt`) — same body as Task 2, under the `erc_urban` package.
+- Modify: `erc_urban/sdk_client.py:65-76` (`send_cmd`), same body as Task 1, Step 3.
+- Modify: `erc_urban/run.py:427-428` (`_halt`), same body as Task 2, Step 3.
+- Test: `test/test_sdk_client.py` (append the Task 1 class; add `import requests`)
+- Create: `test/test_control_resilience.py` (the Task 2 file)
 
 **Interfaces:**
 - Consumes: nothing new.
 - Produces: same as Task 1/2 but importable as `erc_urban.sdk_client.RoverClient.send_cmd` / `erc_urban.run._halt`.
 
-`erc_urban` has no `tests/` directory and `test.sh` does not run a suite against it (only `test/` and `erc_urban_test/tests`). The "test" for this task is that the two packages' relevant code blocks become identical (since they already carry duplicate logic) and that the module still imports cleanly — that is the closest available substitute for a failing/passing test cycle here.
+`test/` is the `erc_urban` suite (its files import `erc_urban.*`), so this task gets the same red/green cycle as Tasks 1 and 2.
 
-- [ ] **Step 1: Run the equivalence check to verify it currently fails (blocks differ)**
+- [ ] **Step 1: Mirror the tests with the import swapped**
 
-Run: `diff <(sed -n '65,80p' erc_urban/sdk_client.py) <(sed -n '65,84p' erc_urban_test/sdk_client.py)`
-Expected: non-empty diff — `erc_urban/sdk_client.py:65-76` is still the pre-Task-1 unguarded `send_cmd` (raises, returns `None`), while `erc_urban_test/sdk_client.py` already has Task 1's fixed version.
+Append `TestSendCmdResilience` from Task 1, Step 1 to `test/test_sdk_client.py`, with every `erc_urban_test.sdk_client.requests.post` patch target changed to `erc_urban.sdk_client.requests.post`, and add `import requests` to its import block.
 
-- [ ] **Step 2: Confirm the `_halt` blocks also differ**
+Create `test/test_control_resilience.py` as a copy of the Task 2 file with `from erc_urban_test.run import _halt, _cmd` changed to `from erc_urban.run import _halt, _cmd`.
 
-Run: `diff <(sed -n '423,428p' erc_urban/run.py) <(sed -n '411,417p' erc_urban_test/run.py)`
-Expected: non-empty diff — `erc_urban/run.py`'s `_halt` still silently swallows a failed send; `erc_urban_test/run.py`'s already warns (Task 2).
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q test/test_sdk_client.py test/test_control_resilience.py -v`
+Expected: the four `TestSendCmdResilience` tests FAIL/ERROR and `test_halt_prints_warning_when_send_fails` FAILS, for the same reasons as in Tasks 1 and 2.
 
 - [ ] **Step 3: Apply the identical edits**
 
-Replace `erc_urban/sdk_client.py:65-76` with the exact `send_cmd` body from Task 1, Step 3 (byte-identical — the method has no package-qualified references).
+Replace `erc_urban/sdk_client.py:65-76` with the exact `send_cmd` body from Task 1, Step 3 (the method has no package-qualified references).
 
 Replace `erc_urban/run.py:427-428` with the exact `_halt` body from Task 2, Step 3.
 
-- [ ] **Step 4: Run the equivalence check and an import smoke test to verify it passes**
+- [ ] **Step 4: Run both suites to verify they pass**
 
 Run:
 ```bash
-diff <(sed -n '65,80p' erc_urban/sdk_client.py) <(sed -n '65,80p' erc_urban_test/sdk_client.py)
-diff <(sed -n '427,432p' erc_urban/run.py) <(sed -n '415,420p' erc_urban_test/run.py)
-PYTHONPATH=. /mnt/c/Users/007ha/miniforge3/envs/rover_env/python.exe -c "import erc_urban.sdk_client, erc_urban.run; print('import ok')"
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest test --ignore=test/test_live_sdk.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests
 ```
-Expected: both `diff`s produce no output (blocks now identical modulo the line-number offset already accounted for in the ranges above), and the import line prints `import ok` with no traceback.
-
-Then re-run the full acceptance check for the whole plan:
-
-Run: `bash /mnt/c/Users/007ha/Desktop/self-drive/.agents/sp_lanes/test.sh writing-plans`
-Expected: `test/` still 286 passed, 1 skipped; `erc_urban_test/tests` now 273 + 7 = 280 passed (4 new in Task 1, 3 new in Task 2), 3 skipped — no regressions, only additions.
+Expected: `test/` 286 + 7 = 293 passed, 1 skipped; `erc_urban_test/tests` 273 + 7 = 280 passed, 3 skipped. No regressions, only additions.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git.exe add erc_urban/sdk_client.py erc_urban/run.py
-git.exe commit -m "fix(urban): send_cmd reports network failure instead of raising"
+git add erc_urban/sdk_client.py erc_urban/run.py test/test_sdk_client.py test/test_control_resilience.py
+git commit -m "fix(urban): send_cmd reports network failure instead of raising"
 ```
 
 ---
@@ -276,17 +272,8 @@ git.exe commit -m "fix(urban): send_cmd reports network failure instead of raisi
 
 **Spec coverage:** There is no external spec; the "spec" is the defect described above. Every element of it is covered: `send_cmd` raising (Task 1), `send_cmd` returning success on a 5xx (Task 1's `test_send_cmd_treats_5xx_as_failure_without_raising`), the halt call silently swallowing failure (Task 2), and the duplicate `erc_urban` copy (Task 3).
 
-**Placeholder scan:** No `TBD`/`implement later`/`add error handling` phrasing; every step has real code and a real command. Task 3 references Task 1/Task 2 code rather than repeating it verbatim in the plan text, which the skill flags as a smell ("Similar to Task N") — but it is intentional here: Task 3's whole point is that the two blocks must end up byte-identical, so pointing at the earlier block *is* the spec for Task 3, not a shortcut around writing it. The blocks themselves are written out in full in Tasks 1 and 2.
+**Placeholder scan:** No `TBD`/`implement later`/`add error handling` phrasing; every step has real code and a real command. Task 3 points at the Task 1/Task 2 code blocks instead of repeating them, because the two packages must end up with byte-identical bodies; the blocks themselves are written out in full in Tasks 1 and 2.
 
 **Type consistency:** `send_cmd` returns `bool` everywhere it's touched (Task 1's implementation, Task 2's `_halt` consuming it, Task 3's mirror). `_halt`'s and `_cmd`'s signatures (`(client: RoverClient, ...) -> None`) are unchanged from their current form in both packages, so no caller elsewhere in `run.py` needs updating — confirmed by grep: every call site (`_halt(client)` / `_cmd(client, lin, ang)`) ignores the return value already.
 
 **Review Focus:** all five items above have an owning task and test: #1 and #3 in Task 1, #2 and #4 in Task 2 (plus Task 1's regression re-run), #5 is a documented limitation with no task (correctly — it's out of scope, not a gap).
-
----
-
-Plan complete and saved to `docs/plans/2026-09-28-control-loop-halt-resilience.md`. Please review the plan. Which execution approach would you prefer?
-
-- **Subagent-driven** — a fresh subagent implements each task and a fresh reviewer checks it before the next one starts, then a whole-branch review at the end. Most thorough; costs a fresh context per task and per review.
-- **Native** — implement every task in this session directly, then one fresh reviewer on the most capable model checks the whole branch. Cheapest and fastest; no independent review until the end.
-
-**For this plan I recommend Native**, because the three tasks are small, sequentially dependent on the exact same 12-line pattern (Task 2 depends on Task 1's return type, Task 3 mirrors both verbatim), there are only three of them, and a shipped mistake here is a `bool`-vs-`None` typo caught immediately by the existing test suite — not the kind of risk that needs a fresh reviewer gate between every task.
