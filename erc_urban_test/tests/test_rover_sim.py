@@ -222,6 +222,25 @@ class TestGps(unittest.TestCase):
         self.assertEqual(d["longitude"], 1000)
         self.assertEqual(NO_FIX, 1000)
 
+    def test_gps_dropout_window_mid_run(self):
+        # Half-open [1.0, 2.5): fix before and after, 1000 inside, even while moving.
+        sim = RoverSim(SimConfig(gps_sigma_m=0.0, gps_dropouts=((1.0, 2.5),)), seed=3)
+        sim.step(0.9)
+        before = sim.data()
+        self.assertNotEqual(before["latitude"], 1000)
+        self.assertGreater(before["gps_signal"], 0.0)
+        sim.step(0.2)  # t = 1.1
+        dropped = sim.data()
+        self.assertEqual(dropped["latitude"], 1000)
+        self.assertEqual(dropped["longitude"], 1000)
+        self.assertEqual(dropped["gps_signal"], 0.0)
+        sim.command(1.0, 0.0)
+        sim.step(1.5)  # t = 2.6
+        after = sim.data()
+        self.assertNotEqual(after["latitude"], 1000)
+        self.assertAlmostEqual(after["latitude"], sim.lat, places=6)
+        self.assertGreater(after["gps_signal"], 0.0)
+
 
 class TestDeterminism(unittest.TestCase):
     def _trace(self, seed):
@@ -305,6 +324,22 @@ class TestFakeClient(unittest.TestCase):
         client = FakeRoverClient(RoverSim(SimConfig(gps_fix=False), seed=1))
         tel = client.get_data()
         self.assertEqual((tel.lat, tel.lon), (1000.0, 1000.0))
+
+    def test_dropout_visible_through_auto_step(self):
+        # auto_step advances inside get_data, so a caller cannot toggle gps_fix
+        # between the step and the read. The window has to live on sim time.
+        sim = RoverSim(SimConfig(gps_sigma_m=0.0, gps_dropouts=((0.5, 0.8),)), seed=1)
+        client = FakeRoverClient(sim, auto_step=0.1)
+        seen_drop = False
+        seen_fix_after = False
+        for _ in range(12):
+            tel = client.get_data()
+            if tel.lat == 1000.0:
+                seen_drop = True
+            elif seen_drop:
+                seen_fix_after = True
+        self.assertTrue(seen_drop)
+        self.assertTrue(seen_fix_after)
 
     def test_checkpoints(self):
         sim = RoverSim(seed=1)

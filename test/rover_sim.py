@@ -14,7 +14,8 @@ Modelled live facts (all configurable through ``SimConfig``):
   * gyros rows are ``[x, y, z, t]``, z = yaw rate in deg/s, LEFT-positive,
     scaled by a gain error (seeded uniform in [0.75, 1.25] unless given).
   * GPS carries Gaussian noise in metres, redrawn every ``gps_period_s``;
-    with no fix latitude and longitude read 1000.
+    with no fix, or inside a ``gps_dropouts`` window, latitude and longitude
+    read 1000.
 
 Public API:
     SimConfig(...)                       dataclass of the knobs above
@@ -71,6 +72,8 @@ class SimConfig:
     gps_sigma_m: float = 2.0
     gps_period_s: float = 1.0
     gps_fix: bool = True
+    # Half-open sim-time windows [start_s, end_s) that report no fix (1000).
+    gps_dropouts: tuple[tuple[float, float], ...] = ()
     battery: int = 100
     # Unix time that sim t = 0 maps to in payload timestamps.
     epoch: float = 1_760_000_000.0
@@ -172,8 +175,17 @@ class RoverSim:
     def lon(self) -> float:
         return self._latlon(self.x, self.y)[1]
 
-    def reported_latlon(self) -> tuple[float, float]:
+    def _gps_has_fix(self) -> bool:
         if not self.cfg.gps_fix:
+            return False
+        t = self.t
+        for start, end in self.cfg.gps_dropouts:
+            if start <= t < end:
+                return False
+        return True
+
+    def reported_latlon(self) -> tuple[float, float]:
+        if not self._gps_has_fix():
             return NO_FIX, NO_FIX
         slot = math.floor(self.t / self.cfg.gps_period_s + 1e-9) if self.cfg.gps_period_s > 0 else None
         if slot is None or slot != self._gps_slot:
@@ -192,7 +204,7 @@ class RoverSim:
             "orientation": round(self.reported_orientation(), 2) % 360.0,
             "lamp": 0,
             "speed": round(abs(self.speed_mps), 3),
-            "gps_signal": 31.25 if self.cfg.gps_fix else 0.0,
+            "gps_signal": 31.25 if self._gps_has_fix() else 0.0,
             "latitude": lat,
             "longitude": lon,
             "vibration": 0.0,
