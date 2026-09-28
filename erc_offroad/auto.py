@@ -128,6 +128,11 @@ def _wrapr(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+def gps_relative_bearing_rad(brg_cw_deg: float, yaw_cw_deg: float) -> float:
+    # brg and yaw are CW-from-North; terrain bearings are left-positive.
+    return math.radians(_wrap180(-(brg_cw_deg - yaw_cw_deg)))
+
+
 def _wedged(d_yaw: float, corr: float, moved: bool, was_turn: bool) -> bool:
     if not moved:
         return False
@@ -165,7 +170,12 @@ def back_and_fill(rec_log, side: float) -> str:
     if ref is None:
         return "no attitude"
     print("    back-and-fill: reverse")
-    _stream(-0.32, 0.0, 1.0, ref, rec_log, allow_tilt_abort=False)
+    ok, reason = _stream(-0.32, 0.0, 1.0, ref, rec_log, allow_tilt_abort=False)
+    if not ok:
+        # Only the absolute-tilt abort survives allow_tilt_abort=False, so the
+        # rover is tipping: pivoting now is how it goes over.
+        print(f"    back-and-fill: {reason} - no turn")
+        return f"back-and-fill aborted: {reason}"
     time.sleep(0.8)
     ref = _ref_attitude() or ref
     print(f"    back-and-fill: turn {'right' if side > 0 else 'left'}")
@@ -221,7 +231,7 @@ def main(argv=None) -> int:
                             cps[idx]["lat"], cps[idx]["lon"])
             yaw = raw.get("orientation")
             if yaw is not None:
-                goal_b = math.radians(_wrap180(brg - float(yaw)))
+                goal_b = gps_relative_bearing_rad(brg, float(yaw))
                 goal_note = f"cp{cps[idx]['seq']} {dist:.0f}m"
                 if dist <= 15.0 and idx < len(cps) - 1:
                     idx += 1
