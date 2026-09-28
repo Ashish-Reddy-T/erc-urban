@@ -123,6 +123,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest erc_urban_test/tests
 
 `test_live_sdk.py` needs the SDK running with a rover connected.
 
+Doing feature work? See [CONTRIBUTING.md](CONTRIBUTING.md) for an isolated
+git worktree setup so branch switches don't drag the route map / venv /
+uncommitted experiments along with them.
+
 ## Not in git
 
 | What | Size | Where it comes from |
