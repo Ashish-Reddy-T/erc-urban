@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -23,6 +24,11 @@ from typing import Any, Optional
 import numpy as np
 import requests
 from PIL import Image
+
+
+def _default_timeout_s() -> float:
+    """Short default so a hung SDK cannot block a whole urban control tick."""
+    return float(os.environ.get("SDK_TIMEOUT_S", "3.0"))
 
 
 @dataclass
@@ -56,10 +62,16 @@ class Checkpoint:
 
 
 class RoverClient:
-    def __init__(self, base_url: str = "http://localhost:8000", timeout: float = 60.0):
-        # Default 60s: first /data or /v2/screenshot can launch headless Chrome.
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        timeout: Optional[float] = None,
+    ):
+        # Default 3s (or SDK_TIMEOUT_S). Constructor override still wins.
+        # Indoor uses ~3s so a hung HTTP call cannot stall the control tick.
+        # The slow first request (Chrome launch) is paid once in warm_up().
         self.base = base_url.rstrip("/")
-        self.timeout = timeout
+        self.timeout = _default_timeout_s() if timeout is None else float(timeout)
 
     # ---- control -----------------------------------------------------------
     def send_cmd(self, linear: float, angular: float, lamp: Optional[int] = None) -> None:
@@ -87,6 +99,8 @@ class RoverClient:
         )
         r.raise_for_status()
         d = r.json()
+        if not isinstance(d, dict):
+            return None, None
         return self._decode(d.get("front_frame")), self._decode(d.get("rear_frame"))
 
     def get_map_frame(self) -> Optional[np.ndarray]:
@@ -118,12 +132,15 @@ class RoverClient:
 
     @staticmethod
     def _decode(b64: Optional[str]) -> Optional[np.ndarray]:
-        if not b64:
+        if not b64 or not isinstance(b64, str):
             return None
         # SDK sometimes prefixes a data URI ("data:image/jpeg;base64,....").
         if "," in b64:
             b64 = b64.split(",", 1)[1]
-        img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        try:
+            img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        except Exception:
+            return None
         return np.asarray(img)
 
     # ---- telemetry ---------------------------------------------------------
@@ -140,19 +157,25 @@ class RoverClient:
         if not isinstance(d, dict):
             return Telemetry(np.nan, np.nan, None, stamp, {})
 
-        lat = d.get("latitude")
-        lon = d.get("longitude")
-        yaw_deg = d.get("orientation")
+        def _finite(v) -> Optional[float]:
+            if isinstance(v, bool):
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return f if math.isfinite(f) else None
 
-        yaw = math.radians(float(yaw_deg)) if yaw_deg is not None else None
+        lat = _finite(d.get("latitude"))
+        lon = _finite(d.get("longitude"))
+        yaw_deg = _finite(d.get("orientation"))
+
+        yaw = math.radians(yaw_deg) if yaw_deg is not None else None
 
         def _last_ts(key):
             v = d.get(key)
             if isinstance(v, list) and v and isinstance(v[-1], list) and v[-1]:
-                try:
-                    return float(v[-1][-1])
-                except (TypeError, ValueError):
-                    return None
+                return _finite(v[-1][-1])
             return None
 
         hw_ts = _last_ts("gyros") or _last_ts("accels")
@@ -161,22 +184,19 @@ class RoverClient:
         yaw_rate = None
         gy = d.get("gyros")
         if isinstance(gy, list) and gy and isinstance(gy[-1], list) and len(gy[-1]) >= 3:
-            try:
-                yaw_rate = float(gy[-1][2])
-            except (TypeError, ValueError):
-                yaw_rate = None
+            yaw_rate = _finite(gy[-1][2])
 
         wheels = None
         rp = d.get("rpms")
         if isinstance(rp, list) and rp and isinstance(rp[-1], list):
             try:
                 wheels = any(abs(float(x)) > 1e-6 for x in rp[-1][:-1])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 wheels = None
 
         return Telemetry(
-            lat=float(lat) if lat is not None else np.nan,
-            lon=float(lon) if lon is not None else np.nan,
+            lat=lat if lat is not None else np.nan,
+            lon=lon if lon is not None else np.nan,
             yaw=yaw,
             stamp=stamp,
             raw=d,
@@ -192,6 +212,19 @@ class RoverClient:
             return None
         r.raise_for_status()
         return r.json()
+
+    def warm_up(self, timeout_s: float = 90.0) -> bool:
+        """One /data GET with a long timeout, before the control loop starts.
+
+        The first request makes the SDK launch headless Chrome, which takes far
+        longer than the per-tick timeout. Paying it once here keeps the short
+        timeout for every tick after.
+        """
+        try:
+            r = requests.get(f"{self.base}/data", timeout=timeout_s)
+            return r.status_code < 500
+        except Exception:
+            return False
 
     def ping(self) -> bool:
         """True if something is listening on http://localhost:8000."""

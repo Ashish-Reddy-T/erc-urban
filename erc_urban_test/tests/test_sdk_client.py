@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,56 @@ def _png_b64(color=(255, 0, 0), size=(4, 4)) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+class TestSdkClientDefaults(unittest.TestCase):
+    def _env_without_override(self):
+        return {k: v for k, v in os.environ.items() if k != "SDK_TIMEOUT_S"}
+
+    def test_default_http_timeout_is_short(self):
+        """Hung HTTP must not block a whole urban control tick (indoor uses ~3s)."""
+        with patch.dict(os.environ, self._env_without_override(), clear=True):
+            client = RoverClient("http://localhost:8000")
+        self.assertEqual(client.timeout, 3.0)
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"SDK_TIMEOUT_S": "10"}):
+            client = RoverClient("http://localhost:8000")
+        self.assertEqual(client.timeout, 10.0)
+
+    def test_constructor_timeout_override(self):
+        with patch.dict(os.environ, {"SDK_TIMEOUT_S": "10"}):
+            client = RoverClient("http://localhost:8000", timeout=1.0)
+        self.assertEqual(client.timeout, 1.0)
+
+
+class TestSdkWarmUp(unittest.TestCase):
+    """The first /data makes the SDK launch headless Chrome, which can take
+    well over the 3 s per-tick budget. Startup pays that once, with its own
+    long timeout, instead of every tick paying a long one."""
+
+    @patch("erc_urban_test.sdk_client.requests.get")
+    def test_warm_up_uses_long_timeout_once(self, mock_get):
+        mock_get.return_value = MagicMock(status_code=200)
+        client = RoverClient("http://localhost:8000", timeout=3.0)
+        self.assertTrue(client.warm_up(timeout_s=90.0))
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args.kwargs["timeout"], 90.0)
+        self.assertTrue(mock_get.call_args.args[0].endswith("/data"))
+        self.assertEqual(client.timeout, 3.0)
+
+    @patch("erc_urban_test.sdk_client.requests.get", side_effect=OSError("timed out"))
+    def test_warm_up_failure_returns_false(self, _):
+        client = RoverClient("http://localhost:8000", timeout=3.0)
+        self.assertFalse(client.warm_up(timeout_s=1.0))
+
+    def test_wait_for_sdk_warms_up_after_ping(self):
+        from erc_urban_test.run import wait_for_sdk
+        client = MagicMock()
+        client.ping.return_value = True
+        client.get_status.return_value = None
+        wait_for_sdk(client)
+        client.warm_up.assert_called_once()
 
 
 class TestSdkClientParse(unittest.TestCase):
