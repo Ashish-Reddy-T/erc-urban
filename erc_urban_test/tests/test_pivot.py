@@ -45,11 +45,14 @@ class TestPulsePivotDirection(unittest.TestCase):
 
 class TestPulsePivotMagnitudeCap(unittest.TestCase):
     def test_commanded_angular_never_exceeds_configured_max(self):
-        pivot = PulsePivot(ang=0.45)
-        for err in (10.0, 45.0, 90.0, 170.0):
-            p = PulsePivot(ang=0.45)
-            _, ang, _ = p.command(err_deg=err, tel=_Tel(), now=0.0)
-            self.assertLessEqual(abs(ang), pivot.ang + 1e-9)
+        # tol_deg low enough that every error here plans a burst, so both the
+        # full-command and the weakened small-turn branch are exercised.
+        for err in (10.0, 45.0, 90.0, 170.0, -10.0, -170.0):
+            p = PulsePivot(ang=0.45, tol_deg=1.0)
+            _, ang, note = p.command(err_deg=err, tel=_Tel(), now=0.0)
+            self.assertTrue(note.startswith("burst"), note)
+            self.assertGreater(abs(ang), 0.0)
+            self.assertLessEqual(abs(ang), p.ang + 1e-9)
 
     def test_large_error_commands_full_configured_magnitude(self):
         pivot = PulsePivot(ang=0.45)
@@ -82,8 +85,15 @@ class TestPulsePivotBurstDuration(unittest.TestCase):
         pivot.command(err_deg=10.0, tel=_Tel(), now=0.0)
         self.assertTrue(pivot.busy())
 
-        _, _, note = pivot.command(err_deg=10.0, tel=_Tel(), now=0.49)
+        _, ang, note = pivot.command(err_deg=10.0, tel=_Tel(), now=0.49)
         self.assertNotEqual(note, "burst done")
+        # Weakened, not full, command, and never below the stiction floor.
+        self.assertLess(abs(ang), pivot.ang)
+        self.assertGreaterEqual(abs(ang), pivot.ang_floor)
+
+        _, ang, note = pivot.command(err_deg=10.0, tel=_Tel(), now=0.51)
+        self.assertEqual(note, "burst done")
+        self.assertEqual(ang, 0.0)
 
 
 class TestPulsePivotAligned(unittest.TestCase):
