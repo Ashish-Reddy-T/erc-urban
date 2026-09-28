@@ -49,6 +49,11 @@ else {
     Write-Host "==> creating branch $Branch from $Base"
     git worktree add $wtDir -b $Branch $Base
 }
+# $ErrorActionPreference does not stop on a native command's exit code.
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "error: git worktree add failed (exit $LASTEXITCODE)"
+    exit 1
+}
 
 $srcEnv = Join-Path "earth-rovers-sdk" ".env"
 $dstEnv = Join-Path $wtDir "earth-rovers-sdk\.env"
@@ -62,9 +67,12 @@ if (-not $SkipPip) {
     $venvDir = Join-Path $wtDir ".venv"
     Write-Host "==> creating venv at $venvDir"
     & $Python -m venv $venvDir
+    if ($LASTEXITCODE -ne 0) { Write-Error "error: venv creation failed"; exit 1 }
     $venvPip = Join-Path $venvDir "Scripts\pip.exe"
     & $venvPip install -q -U pip
+    if ($LASTEXITCODE -ne 0) { Write-Error "error: pip upgrade failed"; exit 1 }
     & $venvPip install -q -r (Join-Path $wtDir "requirements.txt")
+    if ($LASTEXITCODE -ne 0) { Write-Error "error: pip install -r requirements.txt failed"; exit 1 }
 }
 else {
     Write-Host "==> -SkipPip set, not creating a venv"
