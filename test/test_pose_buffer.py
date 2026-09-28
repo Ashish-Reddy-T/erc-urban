@@ -95,6 +95,35 @@ class TestPoseBufferRealign(unittest.TestCase):
         self.assertAlmostEqual(out[0, 0], 0.0, places=6)
         self.assertAlmostEqual(out[0, 1], -1.0, places=6)
 
+    def test_realign_translation_uses_capture_heading_not_odom_axes(self):
+        # Rover already faces odom +y at capture, then drives 0.5 m forward.
+        # In its own frame that is 0.5 m straight ahead, so a waypoint 2 m
+        # ahead must now be 1.5 m ahead, not pushed sideways.
+        pb = PoseBuffer()
+        pb.integrate(0.0, FakeDelta(dyaw=math.pi / 2))
+        pb.integrate(1.0, FakeDelta(dx=0.5))
+        wp = np.array([[2.0, 0.0]])
+        out = pb.realign(wp, t_capture=0.0, t_now=1.0)
+        self.assertTrue(np.allclose(out, np.array([[1.5, 0.0]]), atol=1e-9))
+
+    def test_realign_matches_world_frame_reference_for_general_poses(self):
+        # Capture pose and current pose both arbitrary. Reference: lift the
+        # waypoint to odom with the capture pose, drop it into the current pose.
+        x0, y0, th0 = 1.2, -0.7, math.radians(35.0)
+        x1, y1, th1 = 2.0, 0.4, math.radians(-50.0)
+        pb = PoseBuffer()
+        pb.push(0.0, x0, y0, th0)
+        pb.push(1.0, x1, y1, th1)
+        wp = np.array([[2.0, 0.5], [3.0, -1.0]])
+
+        def rot(t):
+            return np.array([[math.cos(t), -math.sin(t)], [math.sin(t), math.cos(t)]])
+
+        world = wp @ rot(th0).T + np.array([x0, y0])
+        expected = (world - np.array([x1, y1])) @ rot(-th1).T
+        out = pb.realign(wp, t_capture=0.0, t_now=1.0)
+        self.assertTrue(np.allclose(out, expected, atol=1e-9))
+
 
 if __name__ == "__main__":
     unittest.main()
