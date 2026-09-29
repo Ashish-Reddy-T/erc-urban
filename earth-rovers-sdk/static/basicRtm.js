@@ -29,6 +29,13 @@ $(document).ready(function () {
     window.rtm_state = newState;
     window.rtm_reason = reason;
     window.rtm_state_t = Date.now() / 1000;
+    if (reason === "REMOTE_LOGIN") {
+      // Someone else logged in with OUR uid. The uid comes with the SDK key,
+      // not the bot: anyone running an SDK with this key, for ANY rover, kicks
+      // us (and we kick them back 2 s later -> both sessions flap every ~6 s).
+      window.rtm_kicks = (window.rtm_kicks || 0) + 1;
+      window.rtm_kick_times = (window.rtm_kick_times || []).concat([Date.now() / 1000]).slice(-50);
+    }
     if (newState === "ABORTED" || newState === "DISCONNECTED") {
       window.rtm_dead = true;
       if (!relogging) {

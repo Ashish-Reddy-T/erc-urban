@@ -57,6 +57,36 @@ def _match(id2label: dict, names: set[str]) -> set[int]:
     return out
 
 
+def _local_safetensors_dir(model_id: str):
+    """A local folder with config + model.safetensors assembled from the HF
+    cache, or None. The b2 weights are cached as safetensors only under a Hub
+    PR ref, which transformers finds with a network lookup; without network it
+    falls back to pytorch_model.bin, which torch < 2.6 refuses to load (the
+    planner then runs with no segmenter). Loading from this folder needs no network."""
+    import glob
+    if os.path.isdir(model_id):
+        return None
+    root = os.path.expanduser(os.path.join(
+        os.environ.get("HF_HOME", "~/.cache/huggingface"), "hub",
+        "models--" + model_id.replace("/", "--"), "snapshots"))
+    snaps = glob.glob(os.path.join(root, "*"))
+    need = {"config.json", "preprocessor_config.json", "model.safetensors"}
+    have = {}
+    for d in snaps:
+        for f in need:
+            if f not in have and os.path.exists(os.path.join(d, f)):
+                have[f] = os.path.realpath(os.path.join(d, f))
+    if set(have) != need:
+        return None
+    out = os.path.expanduser(os.path.join("~/.cache/erc_models", model_id.replace("/", "--")))
+    os.makedirs(out, exist_ok=True)
+    for f, src in have.items():
+        dst = os.path.join(out, f)
+        if not os.path.exists(dst):
+            os.symlink(src, dst)
+    return out
+
+
 class SemanticTraversability:
     def __init__(
         self,
@@ -98,9 +128,10 @@ class SemanticTraversability:
                 else:
                     device = "cpu"
             self.device = device
-            self.proc = AutoImageProcessor.from_pretrained(_MODEL_ID)
+            src = _local_safetensors_dir(_MODEL_ID) or _MODEL_ID
+            self.proc = AutoImageProcessor.from_pretrained(src)
             self.model = (
-                AutoModelForSemanticSegmentation.from_pretrained(_MODEL_ID)
+                AutoModelForSemanticSegmentation.from_pretrained(src)
                 .to(device)
                 .eval()
             )

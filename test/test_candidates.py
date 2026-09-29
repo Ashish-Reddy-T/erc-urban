@@ -160,6 +160,26 @@ class TestPropose(unittest.TestCase):
             float(np.mean(np.linalg.norm(best.waypoints - prior, axis=1))), 0.3
         )
 
+    def test_perception_rescore_keeps_the_logonav_prior(self):
+        """run.py re-ranks with rescore(cands, obs, trav_fracs=...) and passes
+        no prior. The prior term must survive that second pass, or LogoNav only
+        decides which candidates make the top-K cut."""
+        obs = _obs(goal_bearing=0.6)
+        p = MultiHypothesisPlanner(base=FakeBase(), n_perturbed=6, n_anchors=12)
+        cands = p.propose(obs, k=12)
+        p.rescore(cands, obs, trav_fracs=np.ones(len(cands)))
+        self.assertTrue(any(t.prior != 0.0 for t in p.scorer.last))
+
+    def test_stale_prior_never_reused(self):
+        """A prior from an earlier tick describes a different robot frame."""
+        p = MultiHypothesisPlanner(base=FakeBase(), n_perturbed=6, n_anchors=12)
+        cands = p.propose(_obs(), k=12)
+        later = Observation(front=np.zeros((8, 8, 3), np.uint8), rear=None,
+                            lat=37.0, lon=-122.0, yaw=0.0, stamp=2.0,
+                            goal_bearing=0.0, goal_range_m=50.0)
+        p.rescore(cands, later, trav_fracs=np.ones(len(cands)))
+        self.assertTrue(all(t.prior == 0.0 for t in p.scorer.last))
+
     def test_context_pushed_exactly_once_per_tick(self):
         """K forwards must not mean K frames pushed — that would corrupt the
         model's temporal context."""

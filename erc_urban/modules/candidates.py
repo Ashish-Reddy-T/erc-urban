@@ -115,13 +115,21 @@ class MultiHypothesisPlanner:
         self.scorer = CandidateScorer(
             weights=ScoreWeights(prior=prior_weight), prior_scale_m=prior_scale_m
         )
+        # (obs.stamp, LogoNav's unperturbed path) from the last propose(). The
+        # perception rescore in run.py runs after propose() and has no prior of
+        # its own; without this the 0.6-weight prior term silently dropped out
+        # of the final ranking. Keyed by stamp so a stale path is never reused.
+        self._last_prior: Optional[tuple[float, np.ndarray]] = None
+        self.prior_in_rescore = os.environ.get("PRIOR_IN_RESCORE", "1") != "0"
 
     # LogoNavPlanner's goal/reset API, forwarded so this is a drop-in swap.
     def set_goal(self, lat: float, lon: float) -> None:
         self.base.set_goal(lat, lon)
+        self._last_prior = None
 
     def reset(self) -> None:
         self.base.reset()
+        self._last_prior = None
 
     @property
     def ready(self) -> bool:
@@ -150,6 +158,7 @@ class MultiHypothesisPlanner:
         model_paths = self._model_paths(obs)
         # model_paths[0] is the unperturbed LogoNav trajectory: our prior.
         prior = model_paths[0] if len(model_paths) else None
+        self._last_prior = (obs.stamp, prior) if prior is not None else None
 
         # Match the fan to LogoNav's horizon. The policy shortens its path when
         # blocked (2.69 m on open dirt, 0.69 m facing another rover), and a 3 m
@@ -187,6 +196,13 @@ class MultiHypothesisPlanner:
         """
         if not cands:
             return cands
+        if (
+            prior is None
+            and self.prior_in_rescore
+            and self._last_prior is not None
+            and self._last_prior[0] == obs.stamp
+        ):
+            prior = self._last_prior[1]
         scores = self.scorer.score(
             cands, obs.goal_bearing, prior=prior,
             trav_fracs=trav_fracs, clearances=clearances,

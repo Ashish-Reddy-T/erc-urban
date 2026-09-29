@@ -121,6 +121,19 @@ class TestVetoLogic(unittest.TestCase):
         self.assertFalse(bool(keep[0]), "robot-left path crosses bad surface")
         self.assertTrue(bool(keep[1]), "robot-right path should survive")
 
+    def test_far_wall_does_not_veto_a_long_path(self):
+        """Wuhan plaza: a planter wall 5+ m ahead sits on the rows just under
+        the horizon, where every 10 m anchor's far half lands. Testing the
+        whole length vetoed all 12 and fired escapes long before contact."""
+        def far_band_bad(u, v):
+            return v > 62          # rows <= 62 here are ground beyond ~5 m
+        long_path = _straight(0.0, n=8, length=10.0)
+        capped = TraversabilityVeto(source=FakeSource(far_band_bad), mask_hw=MASK_HW)
+        whole = TraversabilityVeto(source=FakeSource(far_band_bad), mask_hw=MASK_HW,
+                                   max_range_m=None)
+        self.assertTrue(bool(capped.mask(_obs(), [long_path])[0]))
+        self.assertFalse(bool(whole.mask(_obs(), [long_path])[0]))
+
     def test_segformer_source_treats_a_verge_as_drivable(self):
         """
         `SegFormerSource.traversable` documents that soft surface is "costed by

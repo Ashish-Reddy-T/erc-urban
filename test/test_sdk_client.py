@@ -50,6 +50,19 @@ class TestSdkClientParse(unittest.TestCase):
         self.assertIsNone(tel.yaw)
 
     @patch("erc_urban.sdk_client.requests.get")
+    def test_no_fix_sentinel_becomes_nan(self, mock_get):
+        """The SDK reports lat/lon = 1000 with no fix; it must not reach geo."""
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"latitude": 1000, "longitude": 1000, "orientation": 12},
+        )
+        mock_get.return_value.raise_for_status = lambda: None
+        tel = self.client.get_data()
+        self.assertTrue(np.isnan(tel.lat))
+        self.assertTrue(np.isnan(tel.lon))
+        self.assertIsNotNone(tel.yaw)
+
+    @patch("erc_urban.sdk_client.requests.get")
     def test_get_frames_decodes(self, mock_get):
         mock_get.return_value = MagicMock(
             status_code=200,

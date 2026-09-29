@@ -47,6 +47,21 @@ class Telemetry:
     wheels_turning: Optional[bool] = None
 
 
+def _coord(v, limit: float) -> float:
+    """
+    One lat/lon value, or NaN when there is no fix.
+
+    The SDK reports 1000 for both with no fix (indoors, and two of the Mini-4K
+    Córdoba rides). Passed through, that is a bearing to the checkpoint computed
+    from a point off the planet, and every NaN guard downstream misses it.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return np.nan
+    return f if np.isfinite(f) and abs(f) <= limit else np.nan
+
+
 @dataclass
 class Checkpoint:
     id: Optional[int]
@@ -148,8 +163,8 @@ class RoverClient:
                 wheels = None
 
         return Telemetry(
-            lat=float(lat) if lat is not None else np.nan,
-            lon=float(lon) if lon is not None else np.nan,
+            lat=_coord(lat, 90.0),
+            lon=_coord(lon, 180.0),
             yaw=yaw,
             stamp=stamp,
             raw=d,

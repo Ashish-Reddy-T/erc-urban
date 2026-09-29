@@ -72,6 +72,10 @@ ODOM_STALE_S = float(os.environ.get("ODOM_STALE_S", "2.5"))
 # at http://<mac>:OVERLAY_PORT/stream.mjpg for the operator / team website.
 OVERLAY = os.environ.get("OVERLAY", "1") != "0"
 OVERLAY_PORT = int(os.environ.get("OVERLAY_PORT", "8090"))
+# 2026-09-29: another machine ran an SDK with our shared key (rover
+# frodobot_30d2g7). One key = one RTM user id, so the two logins kicked each
+# other every ~6 s; the lap moved 2.8 m in 60 s. Refuse to drive into that.
+ALLOW_RTM_CONFLICT = os.environ.get("ALLOW_RTM_CONFLICT", "0") == "1"
 
 
 class CommandStreamer(threading.Thread):
@@ -148,6 +152,42 @@ def wait_for_telemetry(client: RoverClient, odo: Odometer, timeout_s: float = 60
     raise RuntimeError("no telemetry/camera from the SDK")
 
 
+def check_single_login(client: RoverClient, watch_s: float = 10.0) -> None:
+    """Watch the SDK's RTM login for watch_s. If it is being kicked, another
+    client is logged in with the same SDK key and no run can work."""
+    def read():
+        try:
+            return requests.get(f"{client.base}/data", timeout=8).json() or {}
+        except (requests.RequestException, ValueError):
+            return {}
+    d0 = read()
+    if "rtm_kicks" not in d0:
+        print("login check skipped (this SDK build does not report rtm_kicks)")
+        return
+    t0 = time.monotonic()
+    d = d0
+    while time.monotonic() - t0 < watch_s:
+        time.sleep(2.0)
+        d = read() or d
+    kicked = int(d.get("rtm_kicks", 0)) - int(d0.get("rtm_kicks", 0))
+    foreign = d.get("rtm_foreign_bots") or []
+    if kicked > 0 or d.get("rtm_conflict"):
+        print(f"\n!! LOGIN CONFLICT: the SDK was kicked {max(kicked, 0)}x in {watch_s:.0f} s "
+              "(REMOTE_LOGIN). Someone else is running an SDK with this SDK key"
+              + (f" (rover(s) {', '.join(foreign)} also report to this login)" if foreign else "")
+              + ".\n   One key = one login, even for different rovers: the two sessions knock "
+              "each other off every few seconds and commands/telemetry drop.\n"
+              "   Stop the other SDK (ask the team), then restart ours. ALLOW_RTM_CONFLICT=1 "
+              "drives anyway.\n")
+        if not ALLOW_RTM_CONFLICT:
+            raise SystemExit(2)
+    elif foreign:
+        print(f"note: rover(s) {', '.join(foreign)} also report to this login (no kicks seen) — "
+              "someone used this SDK key for another rover recently")
+    else:
+        print(f"login ok: not kicked in {watch_s:.0f} s")
+
+
 def build_stack():
     route = RouteMap(ROUTE_MAP)
     print(f"route map: {len(route)} nodes, {route.s[-1]:.1f} m, {len(route.turns)} turns, "
@@ -180,6 +220,7 @@ def main() -> None:
     odo = Odometer(client)
     odo.start()
     wait_for_telemetry(client, odo)
+    check_single_login(client)
     bias = odo.calibrate_bias(3.0)
     print(f"gyro bias {bias:+.3f} deg/s (rover must be still)")
     streamer.start()
@@ -215,6 +256,7 @@ def main() -> None:
     last_hw = 0.0
     commanding_since = None
     link_down = False
+    kicks_seen = odo.rtm_kicks
     tick = 0
     last_mode = None
     try:
@@ -223,6 +265,12 @@ def main() -> None:
             if t0 - t_start > MAX_RUN_S:
                 print("MAX_RUN_S reached — stopping")
                 break
+            if odo.rtm_kicks > kicks_seen:
+                print(f"[RTM] our SDK login was kicked (x{odo.rtm_kicks - kicks_seen}, total "
+                      f"{odo.rtm_kicks}) — another client uses this SDK key"
+                      + (f" (rover(s) {', '.join(odo.rtm_foreign)})" if odo.rtm_foreign else "")
+                      + ". Expect link holds until it is stopped.", flush=True)
+                kicks_seen = odo.rtm_kicks
             frame = client.get_front()
             st = odo.state()
             tick_slow = (time.time() - t0) > LINK_STALE_S
@@ -289,7 +337,7 @@ def main() -> None:
                    "v": st.v, "odo_age": st.age_s, "node": L.node, "s": L.s, "p": L.p,
                    "spread": L.spread, "sim": L.sim, "ref": L.ref, "ref_src": L.ref_src, "yaw_err": L.yaw_err,
                    "head_src": L.head_src, "ahead_m": L.ahead_m, "avoid_deg": L.avoid_deg,
-                   "corridor_deg": L.corridor_deg,
+                   "corridor_deg": L.corridor_deg, "gyro_err": L.gyro_err,
                    "inliers": L.inliers, "turn_k": L.turn_k, "spin_rate": L.spin_rate,
                    "cones": L.cones, "checkpoint": L.checkpoint, "frame": frame is not None}
             logf.write(json.dumps(rec) + "\n")

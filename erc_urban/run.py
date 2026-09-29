@@ -12,11 +12,15 @@ Free-drive: USE_MISSION=0 GOAL_LAT=.. GOAL_LON=.. python -m erc_urban.run
 Older earth-rovers-sdk builds have no /status or /missions; neither is required.
 """
 from __future__ import annotations
+import math
 import os
+import signal
 import time
 import numpy as np
 
 from .sdk_client import RoverClient
+from .streamer import CommandStreamer, LinkWatchdog
+from .sdk_guard import SdkGuard
 from .interfaces import Observation
 from .geo import geodesic_bearing_range, reached
 from .modules.baseline import (
@@ -37,14 +41,34 @@ from .modules.route_profile import build_route_profile
 from .modules.traversability import TraversabilityVeto, SegFormerSource
 from .modules.scoring import path_traversable_fractions
 from .modules.odometry import VisualOdometry, Breadcrumbs
+from .modules import osm_route
+from .modules.wheel_odom import WheelOdometry, detect_yaw_axis, parse_gyro_axis
+from erc_indoor.freespace import path_clear
+from .modules.obstacle_memory import ObstacleMemory, choose_full, plan_heading
+from .modules.segment_commit import SegmentCommit
+from .modules.claim import ApproachClaim
+from .modules.heading import HeadingFilter, load_state, save_state
+from .modules.freespace import (
+    FreeSpaceUrban, GRASS_NAMES, GROUND_NAMES, NEVER_LOW_NAMES, OFFROAD_OBSTACLE_NAMES,
+    class_ids, open_side,
+    unlabel_impossible,
+)
 from .modules.commit import CommitWindow
 from .modules.localmap import LocalMap
 from .modules.topograph import TopoGraph, BLOCKED as TOPO_BLOCKED
 from .modules.explore import GapExplorer
-from .modules.selector import VLMSelector, GeminiVertexVLM, dump_candidates
+from .modules.selector import (
+    VLMSelector, GeminiVertexVLM, dump_candidates, render_overlay,
+)
 from .modules.upgrades import LearnedPlanner, VLMSelectorFusion, PoseBuffer
 
 STAGE = int(os.environ.get("STAGE", "1"))
+# Local planner.
+#   fan:   free space per heading from where drivable ground ends (the
+#          erc_indoor method; modules/freespace.py). Default since Wuhan
+#          mission-3, where the K-candidate fan crashed into a planter kerb.
+#   cands: the original K-candidate fan (LogoNav + arcs + vetoes + escapes).
+NAV = os.environ.get("NAV", "fan").strip().lower()
 CTRL_HZ = 5.0
 K = 12 if STAGE < 3 else 18
 USE_MISSION = os.environ.get("USE_MISSION", "1") != "0"
@@ -56,6 +80,9 @@ USE_DIRT_GATE = (
 # Classical near-field contact (lamp-on-wall / dark blob).
 USE_OBS_STOP = os.environ.get("USE_OBS_STOP", "1") != "0"
 # Metric depth clearance. Falls back silently if the checkpoint is missing.
+# Under NAV=fan depth has ONE job: the overhang check in modules/freespace.py
+# (the ground boundary misses things you can see ground under, like a parked
+# e-scooter). The depth costmap it used to feed stays off (USE_COSTMAP).
 USE_DEPTH = os.environ.get("USE_DEPTH", "1") != "0"
 LAMP = int(os.environ.get("LAMP", "1"))
 # Only STOP to pivot for large errors: a stop-and-settle cycle costs ~3 s, so
@@ -75,17 +102,29 @@ SETTLE_S = float(os.environ.get("SETTLE_S", "1.8"))
 STEER_KP = float(os.environ.get("STEER_KP", "0.30"))        # deg/s per deg err
 STEER_MAX_DPS = float(os.environ.get("STEER_MAX_DPS", "10"))
 STEER_MAX_ANG = float(os.environ.get("STEER_MAX_ANG", "0.15"))
-# deg/s per unit angular, until a pivot burst measures the real value. Measured
-# at 15, not the 90 first assumed; below ~0.7 stiction wins and it does not yaw
-# at all. Overestimating here shrinks the steering gain, so the rover
-# under-corrects and drifts until it trips the pivot latch.
-STEER_RATE_PRIOR = float(os.environ.get("STEER_RATE_PRIOR", "15"))
+# Commands streamed at STREAM_HZ (streamer.py) vs posted once per tick. Defined
+# here because the steering constants below depend on it: see STEER_RATE_PRIOR.
+STREAM_CMDS = os.environ.get("STREAM_CMDS", "1") != "0"
+# deg/s per unit angular, until a pivot burst measures the real value.
+#   * posted once per tick: measured 15 (not the 90 first assumed); below ~0.7
+#     stiction wins and it does not yaw at all.
+#   * streamed: measured 37 while driving (Wuhan, 2026-09-23: yaw vs commanded
+#     angular over 154 ticks, peak correlation at ~2.7 s lag). Keeping 15 there
+#     made the loop ~2.5x too hot: heading oscillated with a 10.6 s period
+#     (~4x the loop delay) and 11.7 deg std; 37 with LOOKAHEAD_M 2.0 gave 6.1.
+# Overestimating shrinks the steering gain, so the rover under-corrects and
+# drifts until it trips the pivot latch.
+STEER_RATE_PRIOR = float(os.environ.get("STEER_RATE_PRIOR", "37" if STREAM_CMDS else "15"))
 # Hysteresis: enter align at ALIGN_DEG, stay in it until well inside the band.
 ALIGN_EXIT = float(os.environ.get("ALIGN_EXIT", "22"))
 # Forward speed. v_nom 0.20 with max_angular 0.14 pinned LogoNav to the
 # turn_scale floor at 0.08 throttle, i.e. barely moving.
 V_NOM = float(os.environ.get("V_NOM", "0.34"))
 MAX_ANG = float(os.environ.get("MAX_ANG", "0.26"))
+# Pure-pursuit lookahead. Its heading gain is ~2v/L per second; with ~2.5 s of
+# loop delay and continuous (streamed) motion, 0.8 m oscillates. See
+# STEER_RATE_PRIOR for the measurement.
+LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "2.0" if STREAM_CMDS else "0.8"))
 # Progress watchdog: metres of range that must be closed within this window.
 FREEZE_SEC = float(os.environ.get("FREEZE_SEC", "45"))
 FREEZE_M = float(os.environ.get("FREEZE_M", "1.5"))
@@ -106,7 +145,7 @@ def _auto_device() -> str:
     return "cpu"
 
 # Ground-relative obstacle costmap and its candidate veto.
-USE_COSTMAP = os.environ.get("USE_COSTMAP", "1") != "0"
+USE_COSTMAP = os.environ.get("USE_COSTMAP", "0" if NAV == "fan" else "1") != "0"
 # Telemetry is ~1.1 s stale and commands take ~0.3 s to land, so the rover keeps
 # moving for over a second after a decision. 0.55 m is not a stopping distance,
 # it is a collision report.
@@ -144,6 +183,16 @@ CORRIDOR_ALIGN_DEG = float(os.environ.get("CORRIDOR_ALIGN_DEG", "120"))
 # both flip while yawing (+157 -> -179 -> +112, then STUCK after ~80 ticks).
 TURNAROUND_DPS = float(os.environ.get("TURNAROUND_DPS", "25"))
 TURNAROUND_BURST_CAP = int(os.environ.get("TURNAROUND_BURST_CAP", "4"))
+# The post-turnaround hold ("follow the corridor, ignore a goal that still reads
+# behind") only covers compass/GPS lag right after the spin. Held for the whole
+# leg, it trapped mission-3 (Wuhan): an escape swung the rover south again with
+# CP2 behind it, the latch forbade turning back, and it drove away along
+# corridor(no-gps) into a parked rover. Released after this much driving, and
+# on every escape.
+TURNAROUND_HOLD_M = float(os.environ.get("TURNAROUND_HOLD_M", "4.0"))
+# Consecutive "every candidate untraversable" ticks before that becomes an
+# escape. The first one holds still and re-perceives.
+TRAV_ALL_TICKS = int(os.environ.get("TRAV_ALL_TICKS", "2"))
 # Recovery scan: rotate in steps looking for a drivable heading.
 SCAN_STEPS = int(os.environ.get("SCAN_STEPS", "7"))
 SCAN_STEP_DEG = float(os.environ.get("SCAN_STEP_DEG", "50"))
@@ -180,10 +229,20 @@ _DEPTH_FIT: DepthResponseFit | None = None
 _ROUTE: RouteAligner | None = None
 _TRAV: TraversabilityVeto | None = None
 
-# Visual odometry, the breadcrumb trail, and the commit window.
+# Odometry, the breadcrumb trail, and the commit window.
 USE_ODOM = os.environ.get("USE_ODOM", "1") != "0"
 USE_COMMIT = os.environ.get("USE_COMMIT", "1") != "0"
+# "wheel": rpm + gyro from /data (erc_indoor's Odometer, proven on the Mini+),
+# falling back to VO by itself if this unit's rpms never report travel.
+# "vo": ground-texture visual odometry only.
+ODOM_SOURCE = os.environ.get("ODOM_SOURCE", "wheel").strip().lower()
+WHEEL_M_PER_REV = float(os.environ.get("WHEEL_M_PER_REV", "0.388"))
+# Which /data gyro axis is yaw: "auto" (short left/right wiggle at startup),
+# or "x" / "y" / "z", "-" prefix to flip. Mini+ units so far: z. Wuhan
+# inert-eel-code: x (z stayed flat through a 25 deg spin).
+GYRO_AXIS = os.environ.get("GYRO_AXIS", "auto")
 _VO: VisualOdometry | None = None
+_WHEEL: WheelOdometry | None = None
 _CRUMBS = Breadcrumbs()
 _COMMIT = CommitWindow()
 
@@ -287,6 +346,92 @@ def _vo() -> VisualOdometry | None:
     if _VO is None:
         _VO = VisualOdometry(CALIB)
     return _VO
+
+
+def _odom_update(front):
+    """This tick's motion: wheel odometry when live, else visual odometry."""
+    w = _WHEEL
+    if w is not None and not w.rpm_dead:
+        d = w.update(commanding_forward=_STREAMER.forward if _STREAMER else False)
+        if not w.rpm_dead:
+            return d
+        print("[odom] wheels never reported travel under a forward command — "
+              "this unit's rpms are not live; switching to visual odometry",
+              flush=True)
+    vo = _vo()
+    return vo.update(front) if vo is not None else None
+
+
+def _start_wheel_odom(client) -> None:
+    """Start the rpm+gyro thread and calibrate gyro bias. Rover must be still."""
+    global _WHEEL
+    if not USE_ODOM or ODOM_SOURCE != "wheel":
+        print(f"odometry: {'visual' if USE_ODOM else 'off'} (ODOM_SOURCE={ODOM_SOURCE})")
+        return
+    from erc_indoor.odometry import Odometer
+
+    odo = Odometer(client, m_per_rev=WHEEL_M_PER_REV)
+    odo.start()
+    t0 = time.monotonic()
+    while not odo.ready and time.monotonic() - t0 < 10.0:
+        time.sleep(0.2)
+    if not odo.ready:
+        odo.stop()
+        print("odometry: no rpm/gyro samples in /data after 10 s — using visual odometry")
+        return
+    fixed = parse_gyro_axis(GYRO_AXIS)
+    if fixed is not None:
+        odo.set_yaw_axis(*fixed)
+        how = "set by GYRO_AXIS"
+    elif SEND_CONTROL:
+        def _compass():
+            try:
+                y = client.get_data().yaw
+                return None if y is None else float(np.degrees(y)) % 360.0
+            except Exception:
+                return None
+        for attempt in range(3):
+            # Right after start-mission the link can deliver only a burst or
+            # two (Machakos taper-pivot-valve: 5+5 samples, inconclusive, so
+            # the compass check never ran and a stuck compass took over).
+            w = detect_yaw_axis(odo, lambda lin, ang, hold: (
+                _cmd(client, lin, ang, hold) if hold else _halt(client)), read_compass=_compass)
+            if w.axis is not None and w.compass_err is not None:
+                break
+            print(f"[gyro] wiggle {attempt + 1}: {w.note} — retrying", flush=True)
+            time.sleep(1.0)
+        res, note = w.axis, w.note
+        if HEADING_K_COMPASS == "auto" and w.compass_err is not None:
+            if w.compass_err > COMPASS_BAD_DEG:
+                _HEADING.k_compass = 0.0
+            print(f"[compass] off by {w.compass_err:.0f} deg over the wiggle -> "
+                  f"{'IGNORED (gyro + GPS track only)' if _HEADING.k_compass <= 0 else 'used'}"
+                  f" (k_compass={_HEADING.k_compass})", flush=True)
+        if res is None:
+            how = f"wiggle inconclusive ({note}) -> default"
+            print(f"[gyro] WARNING yaw axis not detected ({note}); keeping "
+                  f"{'-' if odo.yaw_sign < 0 else ''}{'xyz'[odo.yaw_axis]}. "
+                  f"Set GYRO_AXIS if turns look wrong.", flush=True)
+        else:
+            odo.set_yaw_axis(res[0], res[1])
+            how = f"detected by wiggle, left-right {res[2]:+.0f} deg, {note}"
+    else:
+        how = "default (dry run, no wiggle)"
+    bias = odo.calibrate_bias(3.0)
+    global _GRAVITY
+    try:
+        acc = client.get_data().raw.get("accels") or []
+        g = np.array([x[:3] for x in acc if isinstance(x, list) and len(x) >= 3], float).mean(0)
+        if np.linalg.norm(g) > 0.5:
+            _GRAVITY = _snap_gravity(g)
+            print(f"[tilt] gravity at rest {np.round(_GRAVITY, 2).tolist()}, guard {FAN_TILT_DEG:.0f} deg",
+                  flush=True)
+    except Exception:
+        pass
+    _WHEEL = WheelOdometry(odo)
+    axis = f"{'-' if odo.yaw_sign < 0 else ''}{'xyz'[odo.yaw_axis]}"
+    print(f"odometry: wheel+gyro ({WHEEL_M_PER_REV} m/rev, yaw = gyro {axis} [{how}], "
+          f"gyro bias {bias:+.3f} deg/s)", flush=True)
 
 
 def _depth_fit() -> DepthResponseFit | None:
@@ -420,12 +565,164 @@ def _note_blocked(reason: str = "") -> None:
     tg.mark(lm.theta, TOPO_BLOCKED)
 
 
-def _cmd(client: RoverClient, lin: float, ang: float) -> None:
-    client.send_cmd(lin, ang, lamp=LAMP)
+# Command streaming (streamer.py). The loop SETS a command with an expiry and a
+# thread re-sends it at STREAM_HZ, so a slow tick neither starves the rover's
+# command watchdog nor leaves the last command running if the loop hangs.
+# STREAM_CMDS=0 restores the old post-once-per-tick behaviour, which every
+# speed and tick-count constant in this file was originally tuned against.
+# (STREAM_CMDS itself is defined with the steering constants near the top.)
+STREAM_HZ = float(os.environ.get("STREAM_HZ", "10"))
+# How long a driving command stays live without a fresh decision. Longer than
+# the ~0.7 s tick so motion is continuous; short enough that a hung loop stops.
+CMD_HOLD_S = float(os.environ.get("CMD_HOLD_S", "1.0"))
+# A blind reverse must not run on between ticks: cap each reverse tick.
+REVERSE_HOLD_S = float(os.environ.get("REVERSE_HOLD_S", "0.5"))
+# 0 = dry run: the whole stack runs and logs, nothing is sent to /control.
+SEND_CONTROL = os.environ.get("SEND_CONTROL", "1") != "0"
+# Once running, a hung SDK must fail the tick fast (60 s only covers Chrome
+# starting on the first request).
+SDK_TIMEOUT_S = float(os.environ.get("SDK_TIMEOUT_S", "3.0"))
+LINK_STALE_S = float(os.environ.get("LINK_STALE_S", "4.0"))
+_STREAMER: CommandStreamer | None = None
+_LINK = LinkWatchdog(LINK_STALE_S)
+# SDK self-recovery (sdk_guard.py). With neither a camera frame nor telemetry
+# for SDK_DEAD_S, restart the SDK if it is dead, re-send /start-mission (keeps
+# progress, per the SDK README), and carry on. SDK_MANAGE=0: only wait.
+SDK_MANAGE = os.environ.get("SDK_MANAGE", "1") != "0"
+SDK_DEAD_S = float(os.environ.get("SDK_DEAD_S", "20"))
+SDK_MAX_RESTARTS = int(os.environ.get("SDK_MAX_RESTARTS", "6"))
+_GUARD: SdkGuard | None = None
+_LAST_ALIVE = time.monotonic()
+# Mission sequence number of each remaining goal, aligned with `goals`.
+_GOAL_SEQS: list[int] = []
+_CLAIM_HOLD = None                   # (rng, t, goal_index) of the last rejected claim
+CLAIM_RETRY_S = float(os.environ.get("CLAIM_RETRY_S", "5"))
+# Drive in to CLAIM_NEAR_M of each checkpoint before claiming (see claim.py).
+_CLAIM = ApproachClaim(
+    near_m=float(os.environ.get("CLAIM_NEAR_M", "15.0")),   # user 2026-09-28: claim any CP within 15 m
+    stall_s=float(os.environ.get("CLAIM_STALL_S", "45")),
+    stall_m=float(os.environ.get("CLAIM_STALL_M", "4")),
+    max_s=float(os.environ.get("CLAIM_MAX_S", "90")),
+)
+# Live annotated view (candidate fan + HUD) as MJPEG on OVERLAY_PORT, served by
+# erc_indoor's OverlayServer:  http://<mac>:8090/stream.mjpg  and /latest.jpg
+OVERLAY = os.environ.get("OVERLAY", "1") != "0"
+OVERLAY_PORT = int(os.environ.get("OVERLAY_PORT", "8090"))
+# Save every Nth published overlay to runs/urban/run_*/overlay/ for review.
+OVERLAY_SAVE_EVERY = int(os.environ.get("OVERLAY_SAVE_EVERY", "2"))
+_OVERLAY_SRV = None
+_RUN_DIR: str | None = None
+_OVERLAY_N = 0
+
+
+def _tint_semantics(img, good_m, soft_m, hard_m):
+    """SegFormer's verdict on the image: green track, yellow verge, red hazard."""
+    import cv2
+
+    h, w = img.shape[:2]
+    out = img.astype(np.float32)
+    for m, colour, a in ((good_m, (0, 200, 0), 0.28), (soft_m, (230, 200, 0), 0.30),
+                         (hard_m, (230, 0, 0), 0.50)):
+        if m is None:
+            continue
+        mm = cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        out[mm] = out[mm] * (1.0 - a) + np.array(colour, np.float32) * a
+    return out.astype(np.uint8)
+
+
+def _draw_fan(img, fan, cal):
+    """Ground-ends boundary (red), clearance per heading (bars), chosen heading
+    (white), aim (cyan) and remembered obstacles (magenta)."""
+    import cv2
+
+    fs, chosen, want = fan[:3]
+    mem = fan[3] if len(fan) > 3 else None
+    h, w = img.shape[:2]
+    for bnd, col in ((fs.drive_boundary, (255, 40, 40)), (fs.track_boundary, (255, 160, 0))):
+        sx, sy = w / len(bnd), h / FAN_SEG_HW[0]
+        pts = np.stack([(np.arange(len(bnd)) + 0.5) * sx, (bnd + 0.5) * sy], 1).astype(np.int32)
+        cv2.polylines(img, [pts], False, col, 2, lineType=cv2.LINE_AA)
+
+    def col_of(deg):
+        return int(round(cal.cx - cal.fx * np.tan(np.radians(np.clip(deg, -75, 75)))))
+
+    base = h - 4
+    for deg, c in zip(fs.drive.bins_deg, fs.drive.clear_m):
+        colr = (0, 210, 0) if c >= FAN_NEED_M else ((255, 190, 0) if c >= FAN_STOP_M else (230, 0, 0))
+        u = col_of(deg)
+        cv2.line(img, (u, base), (u, base - int(12 + 14 * min(c, 5.0))), colr, 5)
+    hz = int(cal.horizon_v())
+    cv2.line(img, (col_of(want), h - 1), (col_of(want), hz), (0, 230, 255), 2)
+    if chosen is not None:
+        cv2.line(img, (col_of(chosen), h - 1), (col_of(chosen), hz), (255, 255, 255), 4)
+    if mem is not None and len(mem):
+        ahead = mem[mem[:, 0] > 0.15]
+        if len(ahead):
+            uv, ok = cal.project_ground(ahead)
+            for (u, v), o in zip(uv, ok):
+                if o and 0 <= u < w and 0 <= v < h:
+                    cv2.circle(img, (int(u), int(v)), 3, (255, 0, 255), -1)
+
+
+def _publish_overlay(front, cands=None, chosen_idx=None, lines=(),
+                     good_m=None, soft_m=None, hard_m=None,
+                     fan=None, ground=None, grass=None) -> None:
+    """SegFormer tint + candidate fan or free-space fan + HUD. Never raises."""
+    global _OVERLAY_N
+    if _OVERLAY_SRV is None or front is None:
+        return
+    try:
+        import cv2
+
+        if ground is not None:
+            base = _tint_semantics(front, ground, grass, hard_m)
+        else:
+            base = _tint_semantics(front, good_m, soft_m, hard_m)
+        img = (render_overlay(base, cands, CALIB) if cands
+               else np.ascontiguousarray(base))
+        h, w = img.shape[:2]
+        if fan is not None:
+            _draw_fan(img, fan, CALIB.scaled_to(w, h))
+        if cands and chosen_idx is not None and 0 <= chosen_idx < len(cands):
+            uv, ok = CALIB.scaled_to(w, h).project_ground(
+                np.asarray(cands[chosen_idx].waypoints, np.float64))
+            pts = [(int(u), int(v)) for (u, v), g in zip(uv, ok)
+                   if g and -w < u < 2 * w and -h < v < 2 * h]
+            if len(pts) >= 2:
+                cv2.polylines(img, [np.array(pts, np.int32)], False,
+                              (255, 255, 255), 6, lineType=cv2.LINE_AA)
+        band = 22 * max(1, len(lines)) + 8
+        img[:band] = (img[:band] * 0.35).astype(np.uint8)
+        for k, line in enumerate(lines):
+            cv2.putText(img, str(line)[:110], (8, 22 * (k + 1)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        img = cv2.resize(img, (768, int(768 * h / w)))
+        data = _OVERLAY_SRV.publish(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        _OVERLAY_N += 1
+        if _RUN_DIR and OVERLAY_SAVE_EVERY > 0 and _OVERLAY_N % OVERLAY_SAVE_EVERY == 0:
+            with open(os.path.join(_RUN_DIR, "overlay", f"{_OVERLAY_N:06d}.jpg"), "wb") as fh:
+                fh.write(data)
+            # The raw frame too, so a veto or segmentation call can be replayed.
+            cv2.imwrite(os.path.join(_RUN_DIR, "frames", f"{_OVERLAY_N:06d}.jpg"),
+                        cv2.cvtColor(cv2.resize(front, (512, 288)), cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+    except Exception:
+        pass
+
+
+def _cmd(client: RoverClient, lin: float, ang: float,
+         hold_s: float | None = None) -> None:
+    if _STREAMER is not None and STREAM_CMDS:
+        _STREAMER.set(lin, ang, CMD_HOLD_S if hold_s is None else hold_s)
+    elif SEND_CONTROL:
+        client.send_cmd(lin, ang, lamp=LAMP)
 
 
 def _halt(client: RoverClient) -> None:
-    client.send_cmd(0.0, 0.0, lamp=LAMP)
+    if _STREAMER is not None:
+        _STREAMER.halt()
+    elif SEND_CONTROL:
+        client.send_cmd(0.0, 0.0, lamp=LAMP)
 
 
 def _align_cmd(bearing: float) -> tuple[float, float]:
@@ -518,6 +815,28 @@ def _latch_return_turn(
     return remain
 
 
+_TURNAROUND_KEYS = ("turnaround_done", "turnaround_remain", "turnaround_bursts",
+                    "turnaround_seen_cycles", "turnaround_done_at")
+
+
+def _clear_turnaround(stuck_state: dict, why: str) -> None:
+    """Forget the one-shot turnaround so a new one can latch."""
+    had = bool(stuck_state.get("turnaround_done")) or (
+        stuck_state.get("turnaround_remain") is not None)
+    for k in _TURNAROUND_KEYS:
+        stuck_state.pop(k, None)
+    if had:
+        print(f"  turnaround latch released ({why})", flush=True)
+
+
+def _turnaround_expired(stuck_state: dict, travelled_m: float) -> bool:
+    """True once the rover has driven TURNAROUND_HOLD_M since the turnaround."""
+    if not stuck_state.get("turnaround_done"):
+        return False
+    at = stuck_state.setdefault("turnaround_done_at", travelled_m)
+    return travelled_m - at >= TURNAROUND_HOLD_M
+
+
 def _credit_return_burst(stuck_state: dict, burst_s: float) -> bool:
     """Subtract an open-loop burst from the latched remain. True when done."""
     remain = float(stuck_state.get("turnaround_remain", 0.0))
@@ -587,7 +906,7 @@ def build_stack():
         controller = PurePursuitController(
             v_nom=V_NOM, 
             max_angular=MAX_ANG, 
-            lookahead_m=0.8,
+            lookahead_m=LOOKAHEAD_M,
         )
         gate = DirtPathGate() if USE_DIRT_GATE else None
         posebuf = None
@@ -654,6 +973,7 @@ def resolve_goals(
                     "start-mission succeeded but checkpoints list is empty"
                 )
             goals = [(c.lat, c.lon) for c in remaining]
+            _GOAL_SEQS[:] = [int(c.sequence) for c in remaining]
             print(f"mission checkpoints: {len(goals)} remaining (latest_scanned={latest})")
             for c in remaining:
                 print(f"  seq={c.sequence} id={c.id} ({c.lat}, {c.lon})")
@@ -663,8 +983,14 @@ def resolve_goals(
             print(f"mission setup failed: {msg}")
             if "unavailable" in msg.lower():
                 raise SystemExit(2) from e
+            if "GOAL_LAT" not in os.environ or "GOAL_LON" not in os.environ:
+                # The old fallback drove toward (0, 0): a mission that failed
+                # to start must stop, not head for the Gulf of Guinea.
+                print("no GOAL_LAT/GOAL_LON set — not driving")
+                raise SystemExit(2) from e
             print("falling back to GOAL_LAT/GOAL_LON")
 
+    _GOAL_SEQS[:] = []
     goals = [(
         float(os.environ.get("GOAL_LAT", "0.0")),
         float(os.environ.get("GOAL_LON", "0.0")),
@@ -774,6 +1100,9 @@ def _begin_escape(stuck_state: dict, reason: str, key=None) -> None:
     # Baseline for _escape_budget_ok: an escape that led somewhere is not
     # evidence of a trap.
     stuck_state["esc_travel"] = _CRUMBS.travelled_m
+    # An escape turns the rover by an arbitrary amount: a goal behind us now
+    # is a fact about the new heading, not compass lag from the old spin.
+    _clear_turnaround(stuck_state, "escape")
 
     # Remember that THIS heading failed at THIS place, before turning away from
     # it. Every stop routes through here. Without it each escape is computed
@@ -871,10 +1200,826 @@ def _begin_pivot(stuck_state: dict, reason: str) -> None:
     )
 
 
+# ---- NAV=fan: free space per heading (modules/freespace.py) ----------------
+FAN_SEG_HW = (288, 512)
+FAN_NEED_M = float(os.environ.get("FAN_NEED_M", "1.2"))    # a heading counts as clear
+FAN_MIN_M = float(os.environ.get("FAN_MIN_M", "0.8"))      # ...or at least this, if nothing is
+FAN_STOP_M = float(os.environ.get("FAN_STOP_M", "0.6"))    # ground ends this close ahead: escape
+FAN_SLOW_M = float(os.environ.get("FAN_SLOW_M", "1.6"))    # start slowing below this
+FAN_ALIGN_DEG = float(os.environ.get("FAN_ALIGN_DEG", "35"))    # bigger: stop and pulse-turn
+# Straight ahead shorter than this and the clear heading off to one side: turn
+# in place first. Wuhan mission-3: 1.3 m ahead, gap at -10 deg; the gentle
+# steer (~2 deg/s) plus ~2.5 s of link lag drove it into a parked scooter's
+# wheel before the turn happened.
+FAN_TIGHT_M = float(os.environ.get("FAN_TIGHT_M", "1.5"))
+# Near a checkpoint, face it before driving: at 4 m with the goal 15-34 deg off
+# (under FAN_ALIGN_DEG), steering while driving orbited it (Panama mission-2 CP1).
+FAN_NEAR_M = float(os.environ.get("FAN_NEAR_M", "6.0"))
+FAN_BEHIND_LATCH_DEG = float(os.environ.get("FAN_BEHIND_LATCH_DEG", "135"))
+FAN_NEAR_ALIGN_DEG = float(os.environ.get("FAN_NEAR_ALIGN_DEG", "15"))
+# Heading loop, same units as STEER_*: deg/s of yaw per deg of error. ~2.5 s of
+# loop delay (Wuhan) keeps this well under 1/s.
+FAN_KP = float(os.environ.get("FAN_KP", "0.4"))
+FAN_MAX_DPS = float(os.environ.get("FAN_MAX_DPS", "20"))
+FAN_MAX_ANG = float(os.environ.get("FAN_MAX_ANG", "0.35"))
+FAN_TOL_DEG = float(os.environ.get("FAN_TOL_DEG", "8"))
+# Forward floor: below this the skid-steer does not move at all. Mission-3,
+# CP2->CP3: slow x turn factors took V_NOM 0.24 down to lin 0.08 beside a wall,
+# the rover sat still for 6 s and the stuck watchdog fired. (indoor: LIN_MIN.)
+FAN_LIN_MIN = float(os.environ.get("FAN_LIN_MIN", "0.18"))
+# Optional climbing throttle on a clear, gently steered path. Zero preserves
+# the level-ground profile; obstacle approaches and tight turns keep slowing.
+FAN_CLEAR_LIN_MIN = float(os.environ.get("FAN_CLEAR_LIN_MIN", "0"))
+
+def _clear_path_throttle(lin, clearance, ahead, angular):
+    if min(clearance, ahead) >= FAN_SLOW_M and abs(angular) <= 0.20:
+        return max(lin, min(max(FAN_CLEAR_LIN_MIN, 0.0), 0.45))
+    return lin
+# Depth-based overhang check (modules/freespace.py). 0 = boundary only.
+FAN_OVERHANG = os.environ.get("FAN_OVERHANG", "1") != "0"
+# Escape, erc_indoor's: stop, back off if close, look, turn toward the most
+# open side (never a fixed +50 first: that turned mission-3 into the kerb).
+ESC_REV_LIN = float(os.environ.get("ESC_REV_LIN", "-0.30"))
+ESC_REV_S = float(os.environ.get("ESC_REV_S", "1.2"))
+ESC_SETTLE_S = float(os.environ.get("ESC_SETTLE_S", "1.2"))
+ESC_TURN_DEG = float(os.environ.get("ESC_TURN_DEG", "45"))
+ESC_SWING_DEG = float(os.environ.get("ESC_SWING_DEG", "120"))
+ESC_TRIES = int(os.environ.get("ESC_TRIES", "4"))
+ESC_BOXED_MAX = int(os.environ.get("ESC_BOXED_MAX", "3"))
+# Stalled forward (roots, slope, soft dirt): after FAN_BOOST_AFTER_S with no
+# wheel travel, add FAN_BOOST_RATE of linear per second, up to FAN_BOOST_MAX,
+# before the stuck watchdog calls it stuck.
+FAN_BOOST_AFTER_S = float(os.environ.get("FAN_BOOST_AFTER_S", "2.5"))
+FAN_BOOST_RATE = float(os.environ.get("FAN_BOOST_RATE", "0.06"))
+FAN_BOOST_MAX = float(os.environ.get("FAN_BOOST_MAX", "0.25"))
+FAN_STUCK_S = float(os.environ.get("FAN_STUCK_S", "6"))
+FAN_STUCK_M = float(os.environ.get("FAN_STUCK_M", "0.15"))
+# A heading that ended in an escape is off-limits (world frame, +-BLOCK_DEG)
+# until the rover has driven BLOCK_M or BLOCK_S has passed.
+FAN_BLOCK_DEG = float(os.environ.get("FAN_BLOCK_DEG", "15"))
+FAN_BLOCK_M = float(os.environ.get("FAN_BLOCK_M", "3.0"))
+FAN_BLOCK_S = float(os.environ.get("FAN_BLOCK_S", "60"))
+_FSU: FreeSpaceUrban | None = None
+# Places an escape proved shut, in the odometry frame (see obstacle_memory).
+FAN_MEM = os.environ.get("FAN_MEM", "1") == "1"
+# Heading = gyro for turns + slow, gated compass / GPS-course correction
+# (see heading.py). HEADING_FUSE=0 uses the raw compass as before.
+HEADING_FUSE = os.environ.get("HEADING_FUSE", "1") == "1"
+# HEADING_K_COMPASS: "auto" = 0.04, or 0 if the startup wiggle shows the
+# compass not following the gyro (Panama hinge-moto-nova); a number forces it.
+HEADING_K_COMPASS = os.environ.get("HEADING_K_COMPASS", "auto").strip().lower()
+COMPASS_BAD_DEG = float(os.environ.get("COMPASS_BAD_DEG", "20"))
+_HEADING = HeadingFilter(
+    k_compass=0.04 if HEADING_K_COMPASS == "auto" else float(HEADING_K_COMPASS))
+HEADING_STATE = os.environ.get("HEADING_STATE", os.path.join("runs", "heading_state.json"))
+HEADING_BOOTSTRAP_M = float(os.environ.get("HEADING_BOOTSTRAP_M", "8"))
+FAN_MEM_HITS = int(os.environ.get("FAN_MEM_HITS", "3"))
+# Off-road: remember only what is seen close (<= 1.5 m); far boundaries on a
+# slope (a tree line over a crest) read ~1 m and, remembered, boxed the rover in.
+# "urban" (paved allow-list, avoid grass) or "offroad" (park: everything but
+# real obstacles is ground; only things >= FAN_MIN_OBS_H tall stop the rover).
+FAN_TERRAIN = os.environ.get("FAN_TERRAIN", "urban")
+FAN_SIMPLE = os.environ.get("FAN_SIMPLE", "0") == "1"
+FAN_SEGMENT_M = float(os.environ.get("FAN_SEGMENT_M", "0"))
+# Passive obstacle memory is valuable beside urban walls, but unsafe off-road:
+# a stable uphill tree/grass boundary is re-added every tick and tiny odometry
+# changes during pivots smear it into hundreds of magenta spokes.  Off-road
+# remembers only an obstacle that actually caused an escape/stall.
+FAN_MEM_OBSERVE = os.environ.get(
+    "FAN_MEM_OBSERVE", "0" if FAN_TERRAIN == "offroad" else "1") == "1"
+FAN_MEM_ADD_MAX_M = float(os.environ.get(
+    "FAN_MEM_ADD_MAX_M", "1.5" if FAN_TERRAIN == "offroad" else "3.0"))
+_MEM: ObstacleMemory | None = (
+    ObstacleMemory(
+        add_range_m=FAN_MEM_ADD_MAX_M,
+        seen_max_m=float(os.environ.get(
+            "FAN_MEM_SEEN_MAX_M", "1.5" if FAN_TERRAIN == "offroad" else "2.5")),
+    ) if FAN_MEM else None)
+_FAN_IDS: tuple[list[int], ...] | None = None
+FAN_UNLABEL = os.environ.get("FAN_UNLABEL", "1") == "1"
+_FAN_SKY: np.ndarray | None = None         # off-road: sky mask of this tick
+_FAN_RANGE_RELIEF: np.ndarray | None = None  # off-road: depth-gated far boundary
+# Off-road: kerb-like classes, never waved through as flat litter. Only these:
+# Panama leaf litter is labelled tree/building/fence/water, a Machakos
+# concrete kerb is labelled wall.
+KERB_NAMES = {"wall", "stairs", "steps", "stairway"}
+# Never pushed back by range relief: things that stand right here, not a far
+# tree line. Argentina finals: a parked EarthRover 0.25 m beside ours read
+# "truck"; raw depth said 1.0-1.3 m (ratio 4-5), relief moved it to 2 m, the
+# planner saw 5 m open, clipped its wheel and flipped.
+# Vehicles only: SegFormer labels big dry leaves at the lens "person" (Panama),
+# and relief is what lets the rover drive over them.
+# Panama finals: a round concrete tank's wall at the bumper read "wall" and was
+# relieved to 2.0 m, so the rover drove into it over and over (stuck/escape).
+NO_RELIEF_NAMES = {"car", "truck", "van", "bus", "bicycle", "minibike", "motorbike",
+                   "wall", "fence", "railing", "column", "pillar",
+                   # Costa Rica dry run: a dry-stone wall read "rock" was relieved
+                   # to 2.0 m; the rover drove into it and tipped on the stones.
+                   "rock", "stone"}
+# Site-specific extra no-relief classes (comma list). Selebi town roads have
+# people sitting and walking on them, and no leaf litter to misread as one:
+# FAN_NO_RELIEF_EXTRA=person keeps a person at its raw blocking range.
+NO_RELIEF_NAMES = NO_RELIEF_NAMES | {
+    n.strip() for n in os.environ.get("FAN_NO_RELIEF_EXTRA", "").split(",") if n.strip()}
+OFFROAD_GROUND_NAMES = GROUND_NAMES | GRASS_NAMES | {"hill", "mountain", "dirt track", "land", "sand"}
+# Site-specific extra ground classes (comma list). Mexico trial 2026-09-28: the
+# wet dirt lane read "water" (96%) while the dry grass beside it read "plant",
+# so FAN_EXTRA_GROUND=water keeps the rover on the lane and out of the grass.
+OFFROAD_GROUND_NAMES = OFFROAD_GROUND_NAMES | {
+    n.strip() for n in os.environ.get("FAN_EXTRA_GROUND", "").split(",") if n.strip()}
+_FAN_KERB: np.ndarray | None = None
+FAN_MIN_OBS_H = float(os.environ.get("FAN_MIN_OBS_H", "0.12" if FAN_TERRAIN == "offroad" else "0.07"))
+FAN_RANGE_RELIEF_RATIO = float(os.environ.get(
+    "FAN_RANGE_RELIEF_RATIO", "1.2" if FAN_TERRAIN == "offroad" else "0"))
+FAN_RANGE_RELIEF_MIN_M = float(os.environ.get(
+    "FAN_RANGE_RELIEF_MIN_M", "2.0" if FAN_TERRAIN == "offroad" else "0"))
+
+
+def _fan_masks(sem, labels_hi):
+    """(track, grass) masks from an allow-list of ADE20K ground classes."""
+    global _FAN_IDS
+    if _FAN_IDS is None:
+        id2 = sem.model.config.id2label
+        _FAN_IDS = (sorted(class_ids(id2, GROUND_NAMES)), sorted(class_ids(id2, GRASS_NAMES)),
+                    sorted(class_ids(id2, NEVER_LOW_NAMES)))
+    if FAN_TERRAIN == "offroad":
+        # Lenient: only real obstacles (trees, rocks, walls, people ...) are
+        # not ground; grass is plain ground (no grass tier).
+        global _FAN_SKY, _FAN_RANGE_RELIEF, _FAN_KERB
+        if len(_FAN_IDS) < 7:
+            id2 = sem.model.config.id2label
+            _FAN_IDS = _FAN_IDS[:3] + (sorted(class_ids(id2, OFFROAD_OBSTACLE_NAMES - NO_RELIEF_NAMES)),
+                                       sorted(class_ids(id2, {"sky"})),
+                                       sorted(class_ids(id2, {"tree", "palm"})),
+                                       sorted(class_ids(id2, KERB_NAMES)))
+        _FAN_KERB = np.isin(labels_hi, _FAN_IDS[6])
+        _FAN_SKY = np.isin(labels_hi, _FAN_IDS[4])
+        # SegFormer labels the same Panama/Mexico forest edge as tree, pole,
+        # building or sign as the camera turns.  Let every explicit off-road
+        # obstacle class use range relief; the raw-depth ratio still keeps a
+        # genuinely near trunk/person/vehicle at its original blocking range.
+        _FAN_RANGE_RELIEF = np.isin(labels_hi, _FAN_IDS[3])
+        # Allow-list, not "everything but known obstacles": a Costa Rica yard
+        # play slide read "sculpture" and the rover climbed it to 42 deg; a
+        # flower bed read "plant". Ground = paved + earth + grass classes; any
+        # other label is an obstacle unless the flat/depth tests wave it
+        # through, which is what keeps Panama's leaf litter (labelled plant,
+        # bag, tree ...) drivable: 0/260 Panama frames changed.
+        if len(_FAN_IDS) < 8:
+            id2 = sem.model.config.id2label
+            _FAN_IDS = _FAN_IDS + (sorted(class_ids(id2, OFFROAD_GROUND_NAMES)),)
+        return np.isin(labels_hi, _FAN_IDS[7]) & ~_FAN_SKY, np.zeros(labels_hi.shape, bool)
+    track, grass = np.isin(labels_hi, _FAN_IDS[0]), np.isin(labels_hi, _FAN_IDS[1])
+    if FAN_SIMPLE:
+        # One ground class: no paved-vs-grass steering preference.
+        return track | grass, np.zeros_like(grass)
+    if FAN_UNLABEL:
+        hz = CALIB.scaled_to(labels_hi.shape[1], labels_hi.shape[0]).horizon_v()
+        track = unlabel_impossible(track, np.isin(labels_hi, _FAN_IDS[2]) & ~grass, hz)
+    return track, grass
+
+
+def _downsample_labels(sem, labels_hi, out_hw):
+    """Nearest-neighbour label map (and confidence) at the old pipeline's size."""
+    h, w = labels_hi.shape
+    rows = ((np.arange(out_hw[0]) + 0.5) * h / out_hw[0]).astype(int)
+    cols = ((np.arange(out_hw[1]) + 0.5) * w / out_hw[1]).astype(int)
+    conf = getattr(sem, "last_conf", None)
+    if conf is not None and conf.shape == labels_hi.shape:
+        sem.last_conf = conf[np.ix_(rows, cols)]
+    return labels_hi[np.ix_(rows, cols)]
+
+
+def _hdg_note(tel) -> str:
+    raw = getattr(_HEADING, "last_raw", None)
+    if not HEADING_FUSE or raw is None or tel.yaw is None:
+        return ""
+    return f"hdg={np.degrees(tel.yaw) % 360:.0f}(c{raw:.0f}) "
+
+
+def _fan_state(stuck_state: dict) -> dict:
+    fan = stuck_state.get("fan")
+    if fan is None:
+        fan = {
+            "h_lp": 0.0, "fwd_since": None, "fwd_s0": 0.0, "esc": None,
+            "boxed": 0, "esc_travel": None,
+            "pivot": PulsePivot(ang=ALIGN_ANG, settle_s=SETTLE_S, tol_deg=FAN_TOL_DEG,
+                                exact_bursts=_STREAMER is not None and STREAM_CMDS),
+        }
+        stuck_state["fan"] = fan
+    return fan
+
+
+def _fan_forbid(fan: dict, bins_deg: np.ndarray, yaw_deg, now: float):
+    """Bins pointing (in the world) at a heading that recently ended in an escape."""
+    blk = [b for b in fan.get("blocked", [])
+           if _CRUMBS.travelled_m < b[1] and now < b[2]]
+    fan["blocked"] = blk
+    if yaw_deg is None or not blk:
+        return None
+    world = yaw_deg - bins_deg                 # bins are left-positive, yaw is CW
+    forbid = np.zeros(len(bins_deg), bool)
+    for w, _, _ in blk:
+        forbid |= np.abs((world - w + 180.0) % 360.0 - 180.0) <= FAN_BLOCK_DEG
+    return forbid
+
+
+def _fan_begin_escape(fan: dict, why: str, now: float, force_reverse: bool,
+                      yaw_deg=None, failed_rel_deg: float = 0.0,
+                      pts: np.ndarray | None = None, sticky: bool = False) -> None:
+    # Transient only if it came out of nowhere (clear the tick before) and this
+    # heading has not already been let off once. Wuhan: pressed against a
+    # scooter, the overhang read 0.1 m / clear / 0.1 m, and unblocking every
+    # time pushed it into the same wheel three times.
+    sudden = fan.get("last_ahead", 0.0) >= FAN_SLOW_M
+    fan["esc"] = {"phase": "stop", "t": now + ESC_SETTLE_S, "tries": 0,
+                  "swing": 0.0, "force": force_reverse, "reversed": False, "blk": None,
+                  "sudden": sudden}
+    fan["fwd_since"] = None
+    fan["esc_travel"] = _CRUMBS.travelled_m
+    blocked = ""
+    if yaw_deg is not None:
+        w = (yaw_deg - failed_rel_deg) % 360.0
+        entry = (w, _CRUMBS.travelled_m + FAN_BLOCK_M, now + FAN_BLOCK_S)
+        fan.setdefault("blocked", []).append(entry)
+        fan["esc"]["blk"] = entry
+        if why.startswith("tilted"):
+            k = int(FAN_TILT_BLOCK_DEG // (2 * FAN_BLOCK_DEG))
+            for j in range(1, k + 1):
+                for sgn in (-1, 1):
+                    fan["blocked"].append(((w + sgn * j * 2 * FAN_BLOCK_DEG) % 360.0,
+                                           entry[1], entry[2]))
+        blocked = f" — heading {w:.0f} deg blocked for {FAN_BLOCK_M:.0f} m"
+    # "Can't get through here": remember it, so turning back to the goal does
+    # not mean turning back into it.
+    if _MEM is not None and pts is not None and len(pts):
+        n0 = len(_MEM)
+        fan["esc"]["mem_batch"] = _MEM.add(pts, _MEM.yaw, now, sticky=sticky)
+        blocked += f"; remembered {len(_MEM) - n0} pts (mem {len(_MEM)})"
+    print(f"ESCAPE: {why}{blocked}", flush=True)
+
+
+def _fan_escape(fan: dict, fs, want: float, tel, now: float, forbid_fn=None,
+                mem_pts=None):
+    """One tick of the escape episode -> (lin, ang, hold_s, note)."""
+    e, piv = fan["esc"], fan["pivot"]
+    if e["phase"] == "stop":
+        if now < e["t"]:
+            return 0.0, 0.0, None, "escape: stop+settle"
+        if e["force"] or fs.drive.ahead_m < FAN_NEED_M:
+            e["phase"], e["t"] = "rev", now + ESC_REV_S
+        else:
+            e["phase"] = "look"
+            # Still frame, same heading, clear again without backing off: a
+            # one-frame blip or someone who walked through. Wuhan mission-3:
+            # open plaza read 5.0 m, 0.5 m, 5.0 m on consecutive ticks, and
+            # the block sent the rover 15 deg off the goal for 3 m.
+            w0 = e["blk"][0] if e["blk"] is not None else None
+            let_off = [t for t in fan.get("let_off", [])
+                       if _CRUMBS.travelled_m < t[1] and now < t[2]]
+            fan["let_off"] = let_off
+            again = w0 is not None and any(
+                abs((w0 - t[0] + 180.0) % 360.0 - 180.0) <= FAN_BLOCK_DEG for t in let_off)
+            if e["blk"] is not None and e["swing"] == 0.0 and e["sudden"] and not again \
+                    and fs.drive.ahead_m >= FAN_NEED_M:
+                blk = fan.get("blocked", [])
+                if e["blk"] in blk:
+                    blk.remove(e["blk"])
+                let_off.append(e["blk"])
+                e["blk"] = None
+                if _MEM is not None and e.get("mem_batch"):
+                    _MEM.drop_batch(e["mem_batch"])
+                    # This tick's plan still saw those points: look next tick.
+                    return 0.0, 0.0, None, "escape: transient, re-planning"
+                print("  escape: clear again after stopping — transient, heading unblocked",
+                      flush=True)
+    if e["phase"] == "rev":
+        if not e["reversed"]:
+            e["rev_s0"] = _CRUMBS.travelled_m
+        e["reversed"] = True
+        if now < e["t"]:
+            # Blind (no rear camera on the Mini+), hence short. A reverse that
+            # barely moved last time (roots) gets a bit more.
+            return (ESC_REV_LIN - fan.get("rev_boost", 0.0), 0.0, REVERSE_HOLD_S,
+                    "escape: reverse")
+        moved = _CRUMBS.travelled_m - e.get("rev_s0", _CRUMBS.travelled_m)
+        fan["rev_boost"] = (min(0.15, fan.get("rev_boost", 0.0) + 0.075) if moved < 0.05
+                            else max(0.0, fan.get("rev_boost", 0.0) - 0.075))
+        e["phase"], e["t"] = "settle", now + ESC_SETTLE_S
+        return 0.0, 0.0, None, "escape: reversed, settling"
+    if e["phase"] == "settle":
+        if now < e["t"]:
+            return 0.0, 0.0, None, "escape: settle"
+        e["phase"] = "look"
+    # look: a fresh, still frame, plus what is remembered around the rover
+    h, which, inview = choose_full(fs, want, FAN_NEED_M, None, mem_pts, forbid_fn,
+                                   half_width_m=getattr(_FSU, "half_width_m", 0.17))
+    if h is not None and inview and abs(e["swing"] + h) <= ESC_SWING_DEG:
+        fan["esc"] = None
+        print(f"  escape: clear heading {h:+.0f}deg ({which}) — resuming", flush=True)
+        if abs(h) > FAN_TOL_DEG:
+            lin, ang, pn = piv.command(h, tel, now)
+            return lin, ang, piv.burst_remaining(now), f"escape: turn {h:+.0f} pivot[{pn}]"
+        return 0.0, 0.0, None, "escape: clear ahead"
+    e["tries"] += 1
+    if h is not None and not inview and e["tries"] <= ESC_TRIES:
+        # Nothing in view, but memory says that way (aside, or back the way
+        # we came) is open: turn to look at it. At most 90 deg per look.
+        turn = float(np.clip(h, -90.0, 90.0))
+        lin, ang, pn = piv.command(turn, tel, now)
+        return (lin, ang, piv.burst_remaining(now),
+                f"escape: turn {turn:+.0f} toward {h:+.0f} (remembered clear, try "
+                f"{e['tries']}/{ESC_TRIES}) pivot[{pn}]")
+    if e["tries"] > ESC_TRIES:
+        fan["boxed"] += 1
+        if fan["boxed"] > ESC_BOXED_MAX:
+            print(f"STUCK: boxed in {fan['boxed']} times — stopping. Needs walker assist.",
+                  flush=True)
+            raise SystemExit(3)
+        print(f"  escape: boxed in ({fan['boxed']}/{ESC_BOXED_MAX}) — holding 4 s, "
+              f"then backing off again", flush=True)
+        # Same keys as a fresh escape: a missing "reversed" crashed every
+        # tick after a boxed-in hold (Panama mission-2, "tick error: 'reversed'").
+        fan["esc"] = {"phase": "stop", "t": now + 4.0, "tries": 0, "swing": 0.0,
+                      "force": True, "reversed": False, "blk": None, "sudden": False}
+        return 0.0, 0.0, None, "escape: boxed in"
+    turn = open_side(fs) * ESC_TURN_DEG
+    if abs(e["swing"] + turn) > ESC_SWING_DEG:
+        turn = -turn
+    if abs(e["swing"] + turn) > ESC_SWING_DEG:
+        e["phase"], e["t"] = "rev", now + ESC_REV_S
+        return 0.0, 0.0, None, "escape: swing limit — backing off"
+    e["swing"] += turn
+    lin, ang, pn = piv.command(turn, tel, now)
+    return (lin, ang, piv.burst_remaining(now),
+            f"escape: look {turn:+.0f} (try {e['tries']}/{ESC_TRIES}) pivot[{pn}]")
+
+
+# Global route over OpenStreetMap footways (modules/osm_route.py). Machakos
+# leg-1: the CP2->CP3 chord crossed bush, a kerb, gravel and grassy banks for
+# 40+ min while a mapped footway ran from CP2 straight to CP3. Steer at a
+# point OSM_LOOKAHEAD_M along the route; within OSM_DIRECT_M of the checkpoint,
+# or with no route, steer at the checkpoint as before.
+USE_OSM = os.environ.get("USE_OSM", "1") == "1"
+OSM_LOOKAHEAD_M = float(os.environ.get("OSM_LOOKAHEAD_M", "8"))
+OSM_DIRECT_M = float(os.environ.get("OSM_DIRECT_M", "8"))
+OSM_REPLAN_M = float(os.environ.get("OSM_REPLAN_M", "20"))
+# Short legs go straight: checkpoints often sit just off the road (Costa Rica
+# mission-1: 20 m legs beside a junction) and snapping to road nodes there is a
+# detour, not a route. Same for routes much longer than the chord.
+OSM_MIN_LEG_M = float(os.environ.get("OSM_MIN_LEG_M", "40"))
+OSM_MAX_DETOUR = float(os.environ.get("OSM_MAX_DETOUR", "2.5"))
+_OSM: dict = {"payload": None, "goal": None, "route": None, "t": 0.0}
+
+
+def _osm_load(points) -> None:
+    """One Overpass payload covering the whole mission (cached on disk)."""
+    if not USE_OSM or not points:
+        return
+    lats, lons = [p[0] for p in points], [p[1] for p in points]
+    box = osm_route.bbox((min(lats), min(lons)), (max(lats), max(lons)), buffer_m=150.0)
+    fetch = osm_route.CachedFetch()
+    for _ in range(3):
+        payload = fetch(box)
+        if payload:
+            _OSM["payload"] = payload
+            n = sum(1 for e in payload.get("elements", []) if e.get("type") == "way")
+            print(f"[osm] map loaded: {n} ways", flush=True)
+            return
+        time.sleep(3.0)
+    print("[osm] no map (Overpass unreachable) — straight lines to checkpoints", flush=True)
+
+
+def _osm_target(lat: float, lon: float, goal, rng: float):
+    """(lat, lon) to steer at this tick, or None to steer at the checkpoint."""
+    if not USE_OSM or _OSM["payload"] is None or rng <= OSM_DIRECT_M:
+        return None
+    here = (lat, lon)
+    r = _OSM["route"]
+    off = (min(osm_route.haversine_m(here, p) for p in r.waypoints)
+           if r is not None and r.waypoints else float("inf"))
+    if _OSM["goal"] != tuple(goal) or (off > OSM_REPLAN_M and time.monotonic() - _OSM["t"] > 30.0):
+        chord = osm_route.haversine_m(here, tuple(goal))
+        if chord < OSM_MIN_LEG_M:
+            r = osm_route.Route([here, tuple(goal)], "chord", chord, 1.0, "short leg")
+        else:
+            r = osm_route.plan(here, tuple(goal), fetch=lambda box: _OSM["payload"])
+            if r.ok and r.detour_ratio > OSM_MAX_DETOUR:
+                r = osm_route.Route([here, tuple(goal)], "chord", chord, 1.0,
+                                    f"detour x{r.detour_ratio:.1f}")
+        _OSM.update(goal=tuple(goal), route=r, t=time.monotonic())
+        print(f"[osm] route to {goal[0]:.6f},{goal[1]:.6f}: {r.describe()}", flush=True)
+    if r is None or not r.ok:
+        return None
+    return osm_route.next_target(r, here, OSM_LOOKAHEAD_M)
+
+
+# Tilt guard. Machakos leg-1: climbing a kerb/rock edge pitched the rover up
+# until the camera saw only sky; off-road counts sky as ground, read "5 m
+# clear" and kept driving. Gravity is measured at startup (axis differs per
+# unit), so this is the angle away from how the rover sat then.
+FAN_TILT_DEG = float(os.environ.get("FAN_TILT_DEG", "25"))
+# Pivoting on an edge tips the rover sideways/back while it thinks it is
+# standing still (Machakos: slid off a raised bed edge mid-pivot and read
+# 100 deg). Any pivot is cut above FAN_PIVOT_TILT_DEG, every tick.
+FAN_PIVOT_TILT_DEG = float(os.environ.get("FAN_PIVOT_TILT_DEG", "10"))   # rise during one pivot
+# After a tilt escape, block this wide a sector (not FAN_BLOCK_DEG): with
+# +-15 deg the rover re-tried the same Machakos kerb from 20 deg further round,
+# 15 escapes and 2 flips in 8 minutes.
+FAN_TILT_BLOCK_DEG = float(os.environ.get("FAN_TILT_BLOCK_DEG", "45"))
+_GRAVITY: np.ndarray | None = None
+_LAST_ACC = np.zeros(3)
+
+
+def _snap_gravity(g) -> np.ndarray:
+    """Unit gravity, snapped to the nearest axis when within 30 deg of it: tilt
+    is then measured from true vertical, not from however the rover sat at
+    startup. Costa Rica started on a ~9 deg driveway; pivoting there changed
+    tilt relative to the start pose by 20+ deg on flat concrete."""
+    g = np.asarray(g, float)
+    g = g / np.linalg.norm(g)
+    ax = int(np.argmax(np.abs(g)))
+    if abs(g[ax]) > math.cos(math.radians(30.0)):
+        g = np.eye(3)[ax] * np.sign(g[ax])
+    return g
+
+
+def _tilt_deg(tel) -> float | None:
+    acc = (getattr(tel, "raw", None) or {}).get("accels") or []
+    if _GRAVITY is None or not acc:
+        return None
+    # Every sample of the burst: pivot jolts read 30 deg on single samples
+    # while the rover sat level (Machakos).
+    a = np.array([x[:3] for x in acc if isinstance(x, list) and len(x) >= 3], float)
+    if not len(a):
+        return None
+    v = a.mean(0)
+    n = float(np.linalg.norm(v))
+    # Standing still or rolling slowly the IMU reads ~1 g, whatever the tilt.
+    # Costa Rica: one burst read 162 deg (upside down) with the rover level on
+    # its wheels; a glitch or a knock, not a pose.
+    if not 0.75 <= n <= 1.3:
+        return None
+    _LAST_ACC[:] = v
+    t = float(np.degrees(np.arccos(np.clip(np.dot(v / n, _GRAVITY), -1.0, 1.0))))
+    return t if t <= 60.0 else None          # no climb reads like that: a glitch
+
+
+def _tilt_held(fan: dict, tel) -> float | None:
+    """This tick's tilt, but only once it has held for 2 ticks in a row (the
+    lower of the two), so one jolt cannot trigger a back-off."""
+    t = _tilt_deg(tel)
+    prev, fan["tilt_prev"] = fan.get("tilt_prev"), t
+    if t is None or prev is None:
+        return None
+    return min(t, prev)
+
+
+# Slope mode (Costa Rica finals: the lawn up to the house is a steady ~25-30
+# deg grass slope). A steady nose-up/down pitch with little roll and ground
+# visible ahead is a slope, not a kerb or a bench leg: no tilt back-off, and
+# sustained power uphill (at 0.28 the wheels did not turn: 0 cm odometry for
+# minutes in the dry run). Roll is what flips a rover, so roll is never waived.
+FAN_SLOPE = os.environ.get("FAN_SLOPE", "1") != "0"
+FAN_SLOPE_MIN_DEG = float(os.environ.get("FAN_SLOPE_MIN_DEG", "12"))
+FAN_SLOPE_MAX_DEG = float(os.environ.get("FAN_SLOPE_MAX_DEG", "33"))
+FAN_SLOPE_ROLL_DEG = float(os.environ.get("FAN_SLOPE_ROLL_DEG", "12"))
+FAN_SLOPE_LIN = float(os.environ.get("FAN_SLOPE_LIN", "0.55"))
+FAN_SLOPE_AHEAD_M = float(os.environ.get("FAN_SLOPE_AHEAD_M", "1.5"))
+FAN_SLOPE_ALIGN_DEG = float(os.environ.get("FAN_SLOPE_ALIGN_DEG", "70"))
+FAN_FWD_AXIS = int(os.environ.get("FAN_FWD_AXIS", "1"))       # accel y = along the rover
+FAN_FWD_SIGN = float(os.environ.get("FAN_FWD_SIGN", "1"))     # nose up -> +y (Panama climbs)
+
+
+def _pitch_roll() -> tuple[float, float] | None:
+    """(pitch, roll) in degrees from this tick's accel; pitch + = nose up."""
+    if _GRAVITY is None or not np.any(_LAST_ACC):
+        return None
+    up = int(np.argmax(np.abs(_GRAVITY)))
+    fwd = FAN_FWD_AXIS if FAN_FWD_AXIS != up else (up + 1) % 3
+    lat = 3 - up - fwd
+    v = _LAST_ACC
+    vert = float(np.sign(_GRAVITY[up]) * v[up])
+    pitch = float(np.degrees(np.arctan2(FAN_FWD_SIGN * v[fwd], vert)))
+    roll = float(np.degrees(np.arctan2(v[lat], vert)))
+    return pitch, roll
+
+
+def _slope(fan: dict, fs) -> float | None:
+    """Signed pitch when this is a drivable slope (see FAN_SLOPE), else None."""
+    if not FAN_SLOPE or fan.get("tilt_now") is None:
+        return None
+    pr = _pitch_roll()
+    if pr is None:
+        return None
+    pitch, roll = pr
+    if (FAN_SLOPE_MIN_DEG <= abs(pitch) <= FAN_SLOPE_MAX_DEG and abs(roll) < FAN_SLOPE_ROLL_DEG
+            and fs.drive.ahead_m >= FAN_SLOPE_AHEAD_M):
+        return pitch
+    return None
+
+
+def _fan_stuck(fan: dict, lin: float, now: float) -> bool:
+    """Commanded forward FAN_STUCK_S with < FAN_STUCK_M of wheel travel."""
+    if lin <= 0.0:
+        fan["fwd_since"] = None
+        return False
+    if fan["fwd_since"] is None or _CRUMBS.travelled_m - fan["fwd_s0"] >= FAN_STUCK_M:
+        fan["fwd_since"], fan["fwd_s0"] = now, _CRUMBS.travelled_m
+        return False
+    return now - fan["fwd_since"] > FAN_STUCK_S
+
+
+def _fan_step(client, tel, front, rng, bearing, pre_aim, ground, grass,
+              stuck_state, odom, sem_note, goal_index, depth=None) -> bool:
+    """One NAV=fan tick: decide, command, log, publish. Never claims a goal."""
+    global _FSU
+    now = time.monotonic()
+    if _FSU is None:
+        _FSU = FreeSpaceUrban(CALIB, seg_hw=FAN_SEG_HW, min_obstacle_h_m=FAN_MIN_OBS_H,
+                              # Unverified on saved frames (raw depth near-field
+                              # squash defeats it); opt-in only.
+                              occlusion_ratio=float(os.environ.get("FAN_OCCLUSION_RATIO", "0")),
+                              range_relief_ratio=FAN_RANGE_RELIEF_RATIO,
+                              range_relief_min_m=FAN_RANGE_RELIEF_MIN_M)
+    fan = _fan_state(stuck_state)
+    fan["tilt_now"] = _tilt_held(fan, tel)
+    fs = _FSU.estimate(ground, grass, depth,
+                       sky=_FAN_SKY if (FAN_TERRAIN == "offroad" and _FAN_SKY is not None
+                                        and _FAN_SKY.shape == ground.shape) else None,
+                       range_relief=_FAN_RANGE_RELIEF
+                       if (FAN_TERRAIN == "offroad" and _FAN_RANGE_RELIEF is not None
+                           and _FAN_RANGE_RELIEF.shape == ground.shape) else None,
+                       # Kerbs/walls are never flat litter (see FreeSpaceUrban).
+                       hard=_FAN_KERB
+                       if (FAN_TERRAIN == "offroad" and _FAN_KERB is not None
+                           and _FAN_KERB.shape == ground.shape) else None)
+    slope = _slope(fan, fs)
+    slope_up = slope is not None and slope > 0.0
+    prev_ahead = fan.get("ahead_now", fs.drive.ahead_m)
+    fan["last_ahead"], fan["ahead_now"] = prev_ahead, fs.drive.ahead_m
+    chunk = None
+    if FAN_SEGMENT_M > 0:
+        chunk = fan.setdefault("segment", SegmentCommit(now, max_m=FAN_SEGMENT_M))
+        phase = chunk.update(odom, now)
+        if fan["pivot"].busy() or fan["esc"] is not None:
+            chunk.reset(now)
+        else:
+            if chunk.active and (fs.drive.ahead_m < FAN_STOP_M
+                    or fs.drive.clear_at(chunk.heading) < FAN_STOP_M + 0.2
+                    or abs(chunk.heading) > FAN_ALIGN_DEG):
+                chunk.reset(now)
+                phase = "live obstacle/heading stop"
+            if not chunk.active and (now < chunk.ready_at or phase != "ready"):
+                _halt(client)
+                fan["fwd_since"] = None
+                print(f"[segment] STOP {phase}; stationary fresh-frame planning", flush=True)
+                _publish_overlay(front, lines=(f"STOP / PLAN: {phase}",),
+                                 fan=(fs, None, float(np.degrees(bearing)), None),
+                                 ground=ground, grass=grass)
+                return False
+    want = float(np.degrees(pre_aim.bearing))
+    # Heading bootstrap. With the compass ignored and no GPS-track fix yet,
+    # the heading is a guess, so aiming at the checkpoint is aiming anywhere:
+    # Costa Rica mission-1 started beside a steel gate that bent the compass
+    # seed, turned "toward" CP1 into the gate and boxed itself in before
+    # driving the 4 m a fix needs. Drive the clearest way ahead first.
+    boot = (HEADING_FUSE and HEADING_BOOTSTRAP_M > 0 and _HEADING.k_compass <= 0
+            and _HEADING.fixes == 0 and _CRUMBS.travelled_m < HEADING_BOOTSTRAP_M)
+    if boot:
+        c = fs.drive.clear_m
+        ok = c >= min(c.max(), FAN_NEED_M * 2)
+        want = float(fs.drive.bins_deg[ok][np.argmin(np.abs(fs.drive.bins_deg[ok]))]) if ok.any() else 0.0
+        if not fan.get("boot_told"):
+            fan["boot_told"] = True
+            print(f"[heading] no fix yet: driving the clearest way ({want:+.0f} deg) "
+                  f"for up to {HEADING_BOOTSTRAP_M:.0f} m to get a GPS heading", flush=True)
+    yaw_deg = float(np.degrees(tel.yaw)) if tel.yaw is not None else None
+
+    # Goal behind: choose which way to turn round ONCE. At +-180 the sign of
+    # the bearing flips with every degree of noise, and each flip reversed the
+    # pivot (Panama mission-2, CP3 -> CP4: right 90, left 90, right 90 ...).
+    if abs(want) > FAN_BEHIND_LATCH_DEG:
+        if fan.get("behind_dir") is None:
+            fan["behind_dir"] = 1.0 if want >= 0.0 else -1.0
+    elif abs(want) < 90.0:
+        fan["behind_dir"] = None
+    behind_dir = fan.get("behind_dir")
+
+    def forbid_fn(bins):
+        f = _fan_forbid(fan, bins, yaw_deg, now)
+        if behind_dir is not None:
+            wrong = (bins * behind_dir < 0.0) & (np.abs(bins) > 90.0)
+            f = wrong if f is None else (f | wrong)
+        return f
+
+    mem_pts = None
+    if _MEM is not None and (tel.yaw is not None or odom is not None):
+        # Memory frame heading: wheel+gyro odometry (compass only as a fallback).
+        if odom is not None and odom.reason == "wheel" and odom.confidence > 0.0:
+            _MEM.step_odom(odom.dx, odom.dy, odom.dyaw)
+        elif tel.yaw is not None:
+            if odom is not None and odom.confidence > 0.0:
+                _MEM.update_pose(odom.dx, odom.dy, tel.yaw)
+            _MEM.yaw = tel.yaw
+        my = _MEM.yaw
+        _MEM.prune(now)
+        _MEM.clear_seen(fs.drive.pts, my)
+        if FAN_MEM_OBSERVE:
+            _MEM.observe(fs.drive.pts, my, now)
+        mem_pts = _MEM.to_robot(my, max_range_m=10.0, min_hits=FAN_MEM_HITS)
+    # Around what is remembered: the shortest path's heading replaces the
+    # straight bearing when they differ (goal behind a wall, inside a pocket).
+    plan_note = ""
+    if mem_pts is not None and len(mem_pts) and not (chunk and chunk.active):
+        ph = plan_heading(mem_pts, want, rng)
+        if ph is not None and abs((ph - want + 180.0) % 360.0 - 180.0) > 8.0:
+            # Commit to the way round: a pillar dead on the goal line is a
+            # tie, and re-deciding every tick pivoted left, right, left. Keep
+            # the committed world heading until 1 m of travel, or until memory
+            # says it is shut; small corrections (< 30 deg) always go through.
+            prev = fan.get("plan")
+            if yaw_deg is not None:
+                ph_w = (yaw_deg - ph) % 360.0
+                if prev is not None:
+                    rel_c = (yaw_deg - prev[0] + 180.0) % 360.0 - 180.0
+                    turned = abs((ph_w - prev[0] + 180.0) % 360.0 - 180.0) > 30.0
+                    fresh = _CRUMBS.travelled_m - prev[1] < 1.0
+                    open_c = path_clear(mem_pts, rel_c, getattr(_FSU, "half_width_m", 0.17)) \
+                        >= FAN_NEED_M
+                    if turned and fresh and open_c:
+                        ph, ph_w = rel_c, prev[0]
+                    else:
+                        prev = None
+                if prev is None:
+                    fan["plan"] = (ph_w, _CRUMBS.travelled_m)
+            plan_note = f" plan={ph:+.0f}"
+            want = ph
+        else:
+            fan["plan"] = None
+    piv = fan["pivot"]
+    lin = ang = 0.0
+    hold = None
+    h, which = None, ""
+    # Stale wheel data is not "no motion": with a laggy link (Panama, signal
+    # 3, rpm 2+ s old) the stuck watchdog and the stall boost read it as
+    # wheels not turning and fired escapes on open grass. Restart their clock.
+    if odom is not None and odom.reason in ("wheel_stale", "wheel_not_ready"):
+        fan["fwd_since"] = None
+    # Same after a gap in ticks (link loss, SDK restart): the first tick back
+    # otherwise sees "6 s forward, no travel" and escapes on open grass.
+    if now - fan.get("last_tick", now) > 2.0:
+        fan["fwd_since"] = None
+    fan["last_tick"] = now
+    if fan["esc_travel"] is not None and _CRUMBS.travelled_m - fan["esc_travel"] > 2.0:
+        fan["boxed"], fan["esc_travel"] = 0, None      # got going again
+
+    if piv.busy():
+        lin, ang, pn = piv.command(0.0, tel, now)
+        hold, mode = piv.burst_remaining(now), f"pivot[{pn}]"
+    elif fan["esc"] is not None:
+        lin, ang, hold, mode = _fan_escape(fan, fs, want, tel, now, forbid_fn=forbid_fn,
+                                           mem_pts=mem_pts)
+    else:
+        # Full circle: goal behind or aside, and remembered walls, all in one
+        # cost (see choose_full). Out of view means turn in place to look.
+        if chunk and chunk.active:
+            h, which, inview = chunk.heading, "track", True
+            want = h
+        else:
+            h, which, inview = choose_full(fs, want, FAN_NEED_M, FAN_MIN_M, mem_pts, forbid_fn,
+                                           half_width_m=getattr(_FSU, "half_width_m", 0.17))
+        if h is not None and not inview:
+            turn = float(np.clip(h, -90.0, 90.0))
+            lin, ang, pn = piv.command(turn, tel, now)
+            hold, mode = piv.burst_remaining(now), f"turn {h:+.0f} ({which}): pivot[{pn}]"
+        elif fs.drive.ahead_m < FAN_STOP_M or h is None:
+            why = (f"ground ends {fs.drive.ahead_m:.2f} m ahead"
+                   if fs.drive.ahead_m < FAN_STOP_M else "no clear heading in view")
+            _fan_begin_escape(fan, why, now, force_reverse=False,
+                              yaw_deg=yaw_deg, failed_rel_deg=0.0, pts=fs.drive.pts)
+            mode = f"ESCAPE {why}"
+        elif abs(h) > (FAN_SLOPE_ALIGN_DEG if slope_up
+                       else FAN_NEAR_ALIGN_DEG if rng < FAN_NEAR_M else FAN_ALIGN_DEG):
+            # (On a slope, pivoting in place rolls the rover: steer while
+            # driving unless the turn is huge.)
+            lin, ang, pn = piv.command(0.8 * h, tel, now)
+            hold, mode = piv.burst_remaining(now), f"realign {h:+.0f}: pivot[{pn}]"
+        elif fs.drive.ahead_m < FAN_TIGHT_M and abs(h) > FAN_TOL_DEG and not slope_up:
+            lin, ang, pn = piv.command(h, tel, now)
+            hold = piv.burst_remaining(now)
+            mode = f"tight ({fs.drive.ahead_m:.1f}m ahead) turn {h:+.0f}: pivot[{pn}]"
+        else:
+            fan["h_lp"] = 0.5 * fan["h_lp"] + 0.5 * h
+            hl = fan["h_lp"]
+            dps = float(np.clip(FAN_KP * hl, -FAN_MAX_DPS, FAN_MAX_DPS))
+            ang = float(np.clip(dps / max(STEER_RATE_PRIOR, 10.0), -FAN_MAX_ANG, FAN_MAX_ANG))
+            clr = (fs.track if which == "track" else fs.drive).clear_at(h)
+            if chunk and not chunk.active:
+                if chunk.begin(h, min(clr, fs.drive.ahead_m), FAN_STOP_M + 0.2, now):
+                    print(f"[segment] COMMIT {h:+.0f}deg for {chunk.remaining:.2f}m", flush=True)
+                else:
+                    chunk.reset(now)
+                    _halt(client)
+                    fan["fwd_since"] = None
+                    print("[segment] STOP insufficient segment clearance", flush=True)
+                    return False
+            slow = float(np.clip((clr - FAN_STOP_M) / max(FAN_SLOW_M - FAN_STOP_M, 1e-3), 0.5, 1.0))
+            turn = float(np.clip(1.0 - abs(hl) / 45.0, 0.5, 1.0))
+            lin = max(FAN_LIN_MIN, V_NOM * slow * turn * max(pre_aim.speed_scale, 0.6))
+            lin = _clear_path_throttle(lin, clr, fs.drive.ahead_m, ang)
+            mode = f"drive {h:+.0f}deg ({which}, {clr:.1f}m)"
+            if slope_up:
+                lin = max(lin, FAN_SLOPE_LIN)
+                mode += f" SLOPE {slope:+.0f}deg"
+            if chunk and chunk.active:
+                mode += f" COMMIT {chunk.remaining:.2f}m left"
+            if fan["fwd_since"] is not None:
+                stalled = now - fan["fwd_since"] - FAN_BOOST_AFTER_S
+                if stalled > 0.0:
+                    boost = min(FAN_BOOST_MAX, FAN_BOOST_RATE * stalled)
+                    lin += boost
+                    mode += f" boost+{boost:.2f}"
+            tilt = fan.get("tilt_now")
+            # Only UPHILL is waived: nose-down past the limit is the bank toward
+            # the Costa Rica road (dry run: accel y -0.45 heading south).
+            if tilt is not None and tilt > FAN_TILT_DEG and not slope_up:
+                bump = np.stack([np.full(5, 0.25), np.linspace(-0.2, 0.2, 5)], 1)
+                _fan_begin_escape(fan, f"tilted {tilt:.0f} deg (climbing something; accel "
+                                  f"{np.round(_LAST_ACC, 2).tolist()})", now,
+                                  force_reverse=True, yaw_deg=yaw_deg, failed_rel_deg=0.0,
+                                  pts=bump, sticky=True)
+                lin = ang = 0.0
+                mode = "ESCAPE tilt"
+            elif _fan_stuck(fan, lin, now):
+                # Something the camera cannot see (a kerb lip, a low bar) is
+                # right at the bumper: remember a rover-wide strip there.
+                bump = np.stack([np.full(5, 0.25), np.linspace(-0.2, 0.2, 5)], 1)
+                _fan_begin_escape(fan, "stuck: wheels not advancing under a forward command",
+                                  now, force_reverse=True, yaw_deg=yaw_deg, failed_rel_deg=0.0,
+                                  pts=bump, sticky=True)
+                lin = ang = 0.0
+                mode = "ESCAPE stuck"
+    if lin <= 0.0 and not (fan["esc"] and fan["esc"]["phase"] == "rev"):
+        fan["fwd_since"] = None
+    if chunk and (abs(ang) > 0 and lin <= 0 or fan["esc"] is not None):
+        chunk.reset(now)
+
+    odo_s = ""
+    if odom is not None:
+        odo_s = (f"odo({odom.distance_m*100:.1f}cm {np.degrees(odom.dyaw):+.0f}° "
+                 f"{odom.reason}) trail={_CRUMBS.travelled_m:.1f}m ")
+    print(
+        f"  rng={rng:.1f}m bearing={np.degrees(bearing):+.0f}° want={want:+.0f}°{plan_note} "
+        f"{_hdg_note(tel)}"
+        f"aim={pre_aim.source} fan(track {fs.track.ahead_m:.1f}m drive "
+        f"{fs.drive.ahead_m:.1f}m oh={_FSU.last_overhang_cols} ct={_FSU.last_contact_cols}"
+        f"{' mem=%d/%d' % (_MEM.n_confirmed(), len(_MEM)) if _MEM is not None and len(_MEM) else ''}) "
+        f"{odo_s}{sem_note}"
+        f"{_GPS.describe() + ' ' if _GPS.stale else ''}"
+        f"{'pr=%+.0f/%+.0f ' % _pitch_roll() if fan.get('tilt_now') is not None and _pitch_roll() else ''}"
+        f"src=fan[{mode}] "
+        f"cmd lin={lin:.2f} ang={ang:.2f}")
+    _publish_overlay(front, lines=(
+        f"FAN {mode}",
+        f"cmd=({lin:+.2f},{ang:+.2f})  rng={rng:.1f}m  want={want:+.0f}deg  aim={pre_aim.source}",
+        f"ahead track {fs.track.ahead_m:.1f}m / drive {fs.drive.ahead_m:.1f}m   "
+        f"{'OVERHANG x' + str(_FSU.last_overhang_cols) + '  ' if _FSU.last_overhang_cols else ''}"
+        f"{'CONTACT x' + str(_FSU.last_contact_cols) + '  ' if _FSU.last_contact_cols else ''}"
+        f"{'MEM ' + str(len(_MEM)) + '  ' if _MEM is not None and len(_MEM) else ''}"
+        f"{'gps STALE  ' if _GPS.stale else ''}goal {goal_index + 1}",
+    ), fan=(fs, h, want, mem_pts), ground=ground, grass=grass)
+    # Tilt, whatever this tick decided (the drive branch only sees it while
+    # going forward).
+    tilt = fan.get("tilt_now")
+    if (tilt is not None and abs(lin) < 1e-3 and abs(ang) > 1e-3
+          and ((tilt > FAN_TILT_DEG and not slope_up)
+               or tilt - fan.setdefault("tilt_pivot0", tilt) > FAN_PIVOT_TILT_DEG)):
+        bump = np.stack([np.full(5, 0.25), np.linspace(-0.2, 0.2, 5)], 1)
+        _fan_begin_escape(fan, f"tilted {tilt:.0f} deg while pivoting (edge)", now,
+                          force_reverse=True, yaw_deg=yaw_deg, failed_rel_deg=0.0,
+                          pts=bump, sticky=True)
+        lin = ang = 0.0
+    # Tilt when this pivot began: on a uniform slope tilt stays put while
+    # turning; going over an edge raises it.
+    # (Kept through the settle pauses between pulse bursts; reset once it
+    # drives again.)
+    if abs(lin) < 1e-3:
+        if abs(ang) > 1e-3 and tilt is not None:
+            fan.setdefault("tilt_pivot0", tilt)
+    else:
+        fan.pop("tilt_pivot0", None)
+    if abs(lin) < 1e-3 and abs(ang) < 1e-3:
+        _halt(client)
+    else:
+        _cmd(client, lin, ang, hold_s=hold)
+    return False
+
+
 def step(client, planner, selector, gate, posebuf, controller, goal,
          mission_mode: bool, stuck_state: dict | None = None,
          route_profile=None, goal_index: int = 0) -> bool:
-    global _REAR_SEEN
+    global _REAR_SEEN, _LAST_ALIVE
     try:
         front, rear = client.get_frames()
     except Exception:
@@ -882,6 +2027,25 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     if rear is not None:
         _REAR_SEEN = True
     tel = client.get_data()
+    # SDK liveness, independent of GPS: a frame and a non-empty /data payload.
+    if front is not None and tel.raw:
+        _LAST_ALIVE = time.monotonic()
+
+    was_down = _LINK.down
+    moving = _STREAMER.moving if _STREAMER is not None else False
+    if _LINK.update(front, tel.hw_ts, moving):
+        _halt(client)
+        if not was_down:
+            print(
+                f"[LINK] no new image or IMU data for {LINK_STALE_S:.0f} s while "
+                f"commanding motion (telemetry age "
+                f"{tel.age_s if tel.age_s is not None else float('nan'):.0f} s) "
+                f"— holding zero until data flows again",
+                flush=True,
+            )
+        return False
+    if was_down:
+        print("[LINK] data flowing again — resuming", flush=True)
 
     if np.isnan(tel.lat) or np.isnan(tel.lon):
         return False
@@ -893,8 +2057,24 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     # Measured motion. Everything downstream that needs to know how far the
     # rover actually moved reads this, because GPS is frozen, `rpms` is
     # [0,0,0,0] and the compass drifts. Runs before any control decision.
-    vo = _vo()
-    odom = vo.update(front) if vo is not None else None
+    odom = _odom_update(front)
+    if HEADING_FUSE:
+        raw = float(np.degrees(tel.yaw)) if tel.yaw is not None else None
+        ok = odom is not None and odom.confidence > 0.0
+        if _HEADING.est is None and not getattr(_HEADING, "tried_load", False):
+            _HEADING.tried_load = True
+            saved = load_state(HEADING_STATE, tel.lat, tel.lon)
+            if saved is not None:
+                _HEADING.est, _HEADING.fixes = saved, 1
+                print(f"[heading] resumed saved heading {saved:.0f} (rover has not moved)",
+                      flush=True)
+        fused = _HEADING.update(raw, float(np.degrees(odom.dyaw)) if ok else 0.0,
+                                odom.dx if ok else 0.0, tel.lat, tel.lon)
+        _HEADING.last_raw = raw
+        if fused is not None:
+            tel.yaw = float(np.radians(fused))
+            if _HEADING.fixes:
+                save_state(HEADING_STATE, fused, tel.lat, tel.lon, _HEADING.fixes)
     gps_stale = _GPS.update(tel.lat, tel.lon, odom, tel.stamp)
     if odom is not None:
         _CRUMBS.update(odom, tel.stamp)
@@ -914,18 +2094,32 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     route_target = None
     route_note = ""
 
-    if reached(rng):
+    global _CLAIM_HOLD
+    claim_now, claim_why = _CLAIM.update(rng, time.monotonic(), gps_stale=_GPS.stale,
+                                         travelled_m=_CRUMBS.travelled_m)
+    # Just rejected (the server's fix put us past 15 m while ours read inside):
+    # keep driving toward the checkpoint and retry 2 m closer or after
+    # CLAIM_RETRY_S. Retrying every tick halted the rover at the edge for good.
+    hold = _CLAIM_HOLD
+    if claim_now and hold is not None and hold[2] == goal_index \
+            and rng > hold[0] - 2.0 and time.monotonic() - hold[1] < CLAIM_RETRY_S:
+        claim_now = False
+    if claim_now:
         _halt(client)
+        print(f"claiming: {claim_why} (rng={rng:.1f}m)", flush=True)
         if not mission_mode:
             return True
         resp = client.checkpoint_reached()
         if resp.get("_http_status", 200) >= 400:
-            print(f"checkpoint-reached rejected (rng={rng:.1f}m): {resp}")
+            print(f"checkpoint-reached rejected (rng={rng:.1f}m): {resp} "
+                  f"-> driving closer, retry in {CLAIM_RETRY_S:.0f} s or 2 m", flush=True)
+            _CLAIM_HOLD = (rng, time.monotonic(), goal_index)
             return False
+        _CLAIM_HOLD = None
         print(f"checkpoint-reached ok: {resp}")
         return True
 
-    if route_profile is not None:
+    if route_profile is not None and not (NAV == "fan" and FAN_SIMPLE):
         route_target = route_profile.target(goal_index, tel.lat, tel.lon)
         if route_target is not None:
             bearing, _ = geodesic_bearing_range(
@@ -935,6 +2129,13 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
                 f"{route_target.describe()} "
                 f"ckpt_bearing={np.degrees(checkpoint_bearing):+.0f}° "
             )
+
+    if route_target is None and not (NAV == "fan" and FAN_SIMPLE):
+        osm_t = _osm_target(tel.lat, tel.lon, goal, rng)
+        if osm_t is not None:
+            bearing, _ = geodesic_bearing_range(tel.lat, tel.lon, tel.yaw, osm_t[0], osm_t[1])
+            route_note = (f"osm aim={np.degrees(bearing):+.0f}° "
+                          f"ckpt_bearing={np.degrees(checkpoint_bearing):+.0f}° ")
 
     path = analyze(front) if USE_DIRT_GATE else None
     # Prefer front+rear logic; fall back to front-only.
@@ -970,13 +2171,23 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     # here, so it must not be gated on the depth model succeeding — the
     # path-visible check is what stops the rover burying itself.
     sem = _semantics()
+    fan_ground = fan_grass = None
     if sem is not None:
         seg_hw = (
             dg.last_depth.shape[:2]
             if (dg is not None and dg.last_depth is not None)
             else (120, 160)
         )
-        labels = sem.labels(front, seg_hw)
+        if NAV == "fan":
+            # One SegFormer pass at the free-space resolution; everything else
+            # below keeps its low-res labels via nearest-neighbour sampling.
+            labels_hi = sem.labels(front, FAN_SEG_HW)
+            labels = None
+            if labels_hi is not None:
+                fan_ground, fan_grass = _fan_masks(sem, labels_hi)
+                labels = _downsample_labels(sem, labels_hi, seg_hw)
+        else:
+            labels = sem.labels(front, seg_hw)
         if labels is not None:
             hard_m, soft_m, good_m = sem.categorize(labels)
             # Teach the response fit using the ground as a ruler: with measured
@@ -1113,16 +2324,19 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     # whether THIS tick is an in-place manoeuvre, and that answer lives in the
     # route aim. Computing it afterwards let eight collision escapes fire
     # against a rover that had never commanded forward motion.
-    pre_aim = _route().align(
+    pre_aim = (RouteAim(bearing=checkpoint_bearing, confidence=1.0,
+                        source="gps-simple", speed_scale=1.0, corridor_width=0.0)
+               if NAV == "fan" and FAN_SIMPLE else _route().align(
         goal_bearing=bearing,
         corridor_bearing=corr_bearing,
         corridor_width=corr_width,
         track_bearing=track_bearing,
         track_frac=track_frac,
         goal_trusted=not gps_stale,
-    )
+    ))
     if (
         route_profile is not None
+        and not (NAV == "fan" and FAN_SIMPLE)
         and abs(float(np.degrees(bearing))) >= ROUTE_TURNAROUND_DEG
     ):
         # After a false detour the rover can be looking cleanly along the
@@ -1136,6 +2350,17 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
             speed_scale=0.0,
             corridor_width=corr_width,
         )
+
+    if NAV == "fan" and fan_ground is not None and stuck_state is not None:
+        # Off-road range relief intentionally uses RAW depth.  The response fit
+        # calibrates against a flat-ground assumption, which is exactly what is
+        # false on the rising slopes this correction handles.  Urban/Wuhan
+        # keeps the existing corrected-depth path unchanged.
+        fan_depth = (dg.last_raw_depth if FAN_TERRAIN == "offroad" else dg.last_depth) \
+            if dg is not None else None
+        return _fan_step(client, tel, front, rng, bearing, pre_aim, fan_ground,
+                         fan_grass, stuck_state, odom, sem_note, goal_index,
+                         depth=(fan_depth if FAN_OVERHANG else None))
 
     # The explorer gets right of way over the corridor ONLY once it has
     # committed to going around something; otherwise the corridor stays the
@@ -1187,7 +2412,10 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
         else _aligning(stuck_state, bearing)
     )
     # One-shot return leg: after spinning, GPS still claims the goal is behind.
-    # Follow the corridor we just turned onto and do not re-enter align.
+    # Follow the corridor we just turned onto and do not re-enter align, but
+    # only for TURNAROUND_HOLD_M of driving.
+    if stuck_state is not None and _turnaround_expired(stuck_state, _CRUMBS.travelled_m):
+        _clear_turnaround(stuck_state, f"{TURNAROUND_HOLD_M:.0f} m driven since the spin")
     if stuck_state is not None and stuck_state.get("turnaround_done"):
         want_align = False
         if pre_aim.source == "turnaround":
@@ -1237,7 +2465,7 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
                 f"({stuck_state['rev_left']} left)",
                 flush=True,
             )
-            _cmd(client, lin, ang)
+            _cmd(client, lin, ang, hold_s=REVERSE_HOLD_S)
             if stuck_state["rev_left"] <= 0:
                 _halt(client)
                 stuck_state["key"] = None
@@ -1544,7 +2772,8 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
             stuck_state["align_latch"] = True
         if pivot is None:
             pivot = PulsePivot(
-                ang=ALIGN_ANG, settle_s=SETTLE_S, tol_deg=ALIGN_EXIT
+                ang=ALIGN_ANG, settle_s=SETTLE_S, tol_deg=ALIGN_EXIT,
+                exact_bursts=_STREAMER is not None and STREAM_CMDS,
             )
             if stuck_state is not None:
                 stuck_state["pivot_ctl"] = pivot
@@ -1609,7 +2838,14 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
                 f"src=pivot[{note}] cmd lin={lin:.2f} ang={ang:.2f}",
                 flush=True,
             )
-            _cmd(client, lin, ang)
+            _publish_overlay(front, lines=(
+                f"PIVOT {note}",
+                f"rng={rng:.1f}m bearing={np.degrees(bearing):+.0f}deg "
+                f"target={err_deg:+.0f}deg cmd=({lin:+.2f},{ang:+.2f})",
+            ))
+            # A burst ends when PulsePivot planned it to, not when the next slow
+            # tick notices: the streamer holds it for exactly the remainder.
+            _cmd(client, lin, ang, hold_s=pivot.burst_remaining(time.monotonic()))
             return False
     if stuck_state is not None and stuck_state.get("pivot_ctl") is not None:
         stuck_state["pivot_ctl"].reset()
@@ -1738,6 +2974,7 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
                 return False
         cands = safe
 
+    chosen_i = None
     if STAGE == 0 and hasattr(controller, "command_bearing") and path is not None:
         path_bearing = path.center_offset * (35.0 * np.pi / 180.0)
         fused = (1.0 - PATH_BLEND) * bearing + PATH_BLEND * path_bearing
@@ -1787,10 +3024,25 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
             ):
                 veto_note += "route_keep_trav_all "
             elif tv_note.startswith("all_untraversable") and stuck_state is not None:
+                # One frame is not enough to turn around on. Mission-3: a clean
+                # corridor (drive=0.85, hard=0) went 12/12 vetoed for one tick
+                # and the escape swung the rover away from CP2. Stop and look
+                # again; a real wall is still there next tick.
+                n_all = int(stuck_state.get("trav_all_n", 0)) + 1
+                stuck_state["trav_all_n"] = n_all
+                if n_all < TRAV_ALL_TICKS:
+                    _halt(client)
+                    print(f"  traversability: {tv_note} — holding for a second "
+                          f"look ({n_all}/{TRAV_ALL_TICKS})", flush=True)
+                    return False
+                stuck_state["trav_all_n"] = 0
                 _begin_escape(stuck_state, f"traversability: {tv_note}")
                 return False
+            if stuck_state is not None:
+                stuck_state["trav_all_n"] = 0
             idx = new_idx
         chosen = cands[idx]
+        chosen_i = idx
         if CAND_VIZ_DIR and cands:
             n = 0
             if stuck_state is not None:
@@ -1894,7 +3146,7 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
         extra += route_note
     if odom is not None:
         extra += (
-            f"vo({odom.distance_m*100:.1f}cm {np.degrees(odom.dyaw):+.0f}° "
+            f"odo({odom.distance_m*100:.1f}cm {np.degrees(odom.dyaw):+.0f}° "
             f"c={odom.confidence:.2f}{'' if odom.reason == 'ok' else ' ' + odom.reason}) "
             f"trail={len(_CRUMBS.pts)}@{_CRUMBS.travelled_m:.1f}m "
         )
@@ -1923,6 +3175,15 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
         f"{extra}src={src} cmd lin={lin:.2f} ang={ang:.2f}",
         flush=True,
     )
+    _publish_overlay(front, cands, chosen_i, lines=(
+        f"{src}  cmd=({lin:+.2f},{ang:+.2f})  rng={rng:.1f}m  "
+        f"bearing={np.degrees(bearing):+.0f}deg",
+        (f"cost fwd={cm_res.forward_clearance_m:.2f}m pts={cm_res.n_obstacle_points}  "
+         if cm_res is not None else "") + f"{sem_note}{veto_note}",
+        f"{_GPS.describe()}  "
+        + (f"odo {odom.reason} trail {_CRUMBS.travelled_m:.1f}m" if odom is not None else "")
+        + f"   goal {goal_index + 1}",
+    ), good_m=good_m, soft_m=soft_m, hard_m=hard_m)
     if lin <= 0.0 and abs(ang) < 1e-3:
         _halt(client)
         return False
@@ -1930,20 +3191,136 @@ def step(client, planner, selector, gate, posebuf, controller, goal,
     return False
 
 
+def _sdk_recover(client, mission_mode: bool) -> None:
+    """
+    No frame and no telemetry for SDK_DEAD_S: bring the SDK back or stop.
+    The rover is already stationary (command expiry), so this may take its time.
+    """
+    global _LAST_ALIVE
+    _halt(client)
+    print(f"[SDK] no camera frame or telemetry for {SDK_DEAD_S:.0f} s — recovering",
+          flush=True)
+    if _GUARD is None or not SDK_MANAGE:
+        print("[SDK] SDK_MANAGE=0 — waiting for it to come back by itself", flush=True)
+        _LAST_ALIVE = time.monotonic()
+        return
+    saved = client.timeout
+    client.timeout = 60.0          # start-mission can relaunch Chrome
+    try:
+        while not _GUARD.recover(client, mission_mode):
+            if _GUARD.restarts >= SDK_MAX_RESTARTS:
+                print(f"[SDK] gave up after {_GUARD.restarts} restarts — stopping",
+                      flush=True)
+                raise SystemExit(4)
+    finally:
+        client.timeout = saved
+    _LAST_ALIVE = time.monotonic()
+
+
+def _scanned_through(client) -> int | None:
+    """latest_scanned_checkpoint, or None if it cannot be read."""
+    try:
+        _, latest = client.get_checkpoints()
+        return int(latest)
+    except Exception:
+        return None
+
+
+def _sigterm(*_):
+    # `kill` must stop the rover through main()'s finally, not end Python with
+    # the last command still streaming.
+    raise KeyboardInterrupt
+
+
+def _lan_ip() -> str | None:
+    """This Mac's LAN address (UDP connect sends nothing), for a phone/laptop link."""
+    import socket
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
 def main():
-    client = RoverClient(os.environ.get("SDK_URL", "http://localhost:8000"))
+    global _STREAMER, _OVERLAY_SRV, _GUARD, _RUN_DIR
+    sdk_url = os.environ.get("SDK_URL", "http://localhost:8000")
+    client = RoverClient(sdk_url)
     planner, selector, gate, posebuf, controller = build_stack()
     ready = getattr(planner, "ready", None)
     print(
         f"STAGE={STAGE} planner={type(planner).__name__} "
         f"ready={ready} gate={type(gate).__name__ if gate else 'off'} "
         f"USE_DIRT_GATE={USE_DIRT_GATE} USE_OBS_STOP={USE_OBS_STOP} "
-        f"USE_DEPTH={USE_DEPTH} LAMP={'on' if LAMP else 'off'}"
+        f"USE_DEPTH={USE_DEPTH} LAMP={'on' if LAMP else 'off'} "
+        f"SEND_CONTROL={SEND_CONTROL} STREAM_CMDS={STREAM_CMDS} SDK_MANAGE={SDK_MANAGE}"
     )
+    _GUARD = SdkGuard(sdk_url, manage=SDK_MANAGE)
+    if SDK_MANAGE:
+        print(f"[SDK] status at start: {_GUARD.ensure_healthy()}", flush=True)
     wait_for_sdk(client)
+    if STREAM_CMDS:
+        _STREAMER = CommandStreamer(client, send=SEND_CONTROL, hz=STREAM_HZ, lamp=LAMP)
+        _STREAMER.halt()
+        _STREAMER.start()
+    else:
+        _halt(client)
+    if OVERLAY:
+        try:
+            from erc_indoor.overlay import OverlayServer
+
+            port = OVERLAY_PORT
+            for port in range(OVERLAY_PORT, OVERLAY_PORT + 6):
+                try:
+                    # A second mission in the same process keeps the first server.
+                    _OVERLAY_SRV = _OVERLAY_SRV or OverlayServer(port)
+                    break
+                except OSError:          # port taken (a stale run): try the next
+                    continue
+            if _OVERLAY_SRV is None:
+                raise OSError(f"ports {OVERLAY_PORT}-{OVERLAY_PORT + 5} all taken")
+            port = getattr(getattr(_OVERLAY_SRV, "httpd", None), "server_address", (0, port))[1]
+            ip = _lan_ip()
+            print(f"LIVE VIEW  http://localhost:{port}/stream.mjpg"
+                  + (f"   (same network: http://{ip}:{port}/stream.mjpg)" if ip else "")
+                  + f"   still frame: /latest.jpg", flush=True)
+            if OVERLAY_SAVE_EVERY > 0:
+                _RUN_DIR = os.path.join("runs", "urban", time.strftime("run_%Y%m%d_%H%M%S"))
+                os.makedirs(os.path.join(_RUN_DIR, "overlay"), exist_ok=True)
+                os.makedirs(os.path.join(_RUN_DIR, "frames"), exist_ok=True)
+                print(f"overlays + raw frames saved to {_RUN_DIR}/ (every {OVERLAY_SAVE_EVERY} ticks)")
+        except OSError as e:
+            print(f"overlay server not started ({e})")
+    signal.signal(signal.SIGTERM, _sigterm)
+    # A background launch inherits SIGINT as IGNORED, so Ctrl-C / kill -INT
+    # would do nothing while the rover drives. Restore Python's handler.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        _drive(client, planner, selector, gate, posebuf, controller)
+    except KeyboardInterrupt:
+        print("interrupted — halting", flush=True)
+    finally:
+        # Every exit path, including STUCK's SystemExit(3), ends here. A second
+        # Ctrl-C / kill must not interrupt the halt itself.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if _STREAMER is not None:
+            _STREAMER.stop(lamp_off=True)
+        elif SEND_CONTROL:
+            try:
+                client.send_cmd(0.0, 0.0, lamp=0)
+            except Exception:
+                pass
+        print("stopped (lamp off)", flush=True)
+
+
+def _drive(client, planner, selector, gate, posebuf, controller):
     dg = _depth_gate()
     print(f"depth_gate={'ready' if dg else 'off/unavailable'}")
-    _cmd(client, 0.0, 0.0)
 
     goals, mission_mode, route_goals, route_start_index = resolve_goals(client)
     if not goals:
@@ -1954,6 +3331,16 @@ def main():
         print(f"route profile: {route_profile.describe()}")
 
     wait_for_gps(client)
+    try:
+        t0 = client.get_data()
+        _osm_load(list(route_goals or goals) + [(t0.lat, t0.lon)])
+    except Exception as e:
+        print(f"[osm] load failed: {e}", flush=True)
+    # After start-mission: before it, /data answers 400 in mission mode.
+    _start_wheel_odom(client)
+    # Startup is over (Chrome launched, mission started): from here a request
+    # that hangs is a dead link, and the tick must fail fast and halt.
+    client.timeout = SDK_TIMEOUT_S
 
     dt = 1.0 / CTRL_HZ
     for i, goal in enumerate(goals):
@@ -1961,13 +3348,14 @@ def main():
         if hasattr(planner, "set_goal"):
             planner.set_goal(goal[0], goal[1])
         stuck_state: dict = {}
+        _CLAIM.start_goal(is_last=(i == len(goals) - 1),
+                          is_first=bool(mission_mode and i < len(_GOAL_SEQS)
+                                        and _GOAL_SEQS[i] == 1))
         tel = client.get_data()
-        if (
-            not np.isnan(tel.lat)
-            and tel.yaw is not None
-            and reached(geodesic_bearing_range(tel.lat, tel.lon, tel.yaw, *goal)[1])
-        ):
-            print(f"already within 15 m of {goal} — claiming without driving")
+        rng0 = (geodesic_bearing_range(tel.lat, tel.lon, tel.yaw, *goal)[1]
+                if not np.isnan(tel.lat) and tel.yaw is not None else float("nan"))
+        if reached(rng0) and (_CLAIM.is_last or _CLAIM.is_first or rng0 <= _CLAIM.near_m):
+            print(f"already within {rng0:.1f} m of {goal} — claiming without driving")
             _halt(client)
             if mission_mode:
                 resp = client.checkpoint_reached()
@@ -1997,10 +3385,18 @@ def main():
             except Exception as e:
                 _halt(client)
                 print("tick error:", e)
+            if time.monotonic() - _LAST_ALIVE > SDK_DEAD_S:
+                _sdk_recover(client, mission_mode)
+                # The claim may have landed just before the SDK died.
+                if mission_mode and i < len(_GOAL_SEQS):
+                    latest = _scanned_through(client)
+                    if latest is not None and latest >= _GOAL_SEQS[i]:
+                        print(f"checkpoint seq {_GOAL_SEQS[i]} already scanned "
+                              f"(latest={latest}) — next goal", flush=True)
+                        break
             time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
-    client.send_cmd(0.0, 0.0, lamp=0)
-    print("done (lamp off)")
+    print("done — all goals reached")
 
 
 if __name__ == "__main__":

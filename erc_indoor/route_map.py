@@ -75,14 +75,32 @@ class RouteMap:
         self.finish_s: float = meta["finish_s"]
         self.desc = np.load(os.path.join(root, "desc.npy")).astype(np.float32)
         self._feat_cache: dict[int, object] = {}
-        # Optional night views (twin.py): a second picture of each node.
-        self.twin = None
-        self.twin_desc = None
-        self._twin_cache: dict[int, object] = {}
-        tj = os.path.join(root, "twin", "twin.json")
-        if os.path.exists(tj) and os.environ.get("USE_TWIN", "1") != "0":
-            self.twin = np.array(json.load(open(tj))["twin"])
-            self.twin_desc = np.load(os.path.join(root, "twin", "desc.npy")).astype(np.float32)
+        # Optional extra views (twin.py): more pictures of each node from
+        # other laps. route_map/twin = the night lap; route_map/twin_<name> =
+        # further laps (e.g. twin_today, recorded in competition-like light).
+        # USE_TWIN=0 disables all; TWINS=night,today selects by name.
+        self.twins: list[dict] = []
+        self._twin_cache: dict[tuple, object] = {}
+        want = os.environ.get("TWINS")
+        want = set(want.split(",")) if want else None
+        if os.environ.get("USE_TWIN", "1") != "0":
+            for d in sorted(os.listdir(root)):
+                if not (d == "twin" or d.startswith("twin_")):
+                    continue
+                tj = os.path.join(root, d, "twin.json")
+                if not os.path.exists(tj):
+                    continue
+                name = "night" if d == "twin" else d[len("twin_"):]
+                if want is not None and name not in want:
+                    continue
+                self.twins.append({
+                    "name": name, "dir": d,
+                    "idx": np.array(json.load(open(tj))["twin"]),
+                    "desc": np.load(os.path.join(root, d, "desc.npy")).astype(np.float32),
+                })
+        # back-compat: the first extra view set
+        self.twin = self.twins[0]["idx"] if self.twins else None
+        self.twin_desc = self.twins[0]["desc"] if self.twins else None
 
     def __len__(self) -> int:
         return len(self.s)
@@ -99,24 +117,36 @@ class RouteMap:
             self._feat_cache[i] = features(self.image(i))
         return self._feat_cache[i]
 
-    def twin_image(self, i: int):
-        if self.twin is None or self.twin[int(i)] < 0:
-            return None
-        k = int(self.twin[int(i)])
-        return np.asarray(Image.open(os.path.join(self.root, "twin", "frames", f"{k:05d}.jpg")).convert("RGB"))
+    @property
+    def n_twins(self) -> int:
+        return len(self.twins)
 
-    def twin_features(self, i: int):
-        """Night-view features for node i, or None where there is no twin."""
-        from .bearing import features
-        if self.twin is None or self.twin[int(i)] < 0:
+    def twin_name(self, t: int = 0) -> str:
+        return self.twins[t]["name"]
+
+    def _twin_path(self, i: int, t: int):
+        if t >= len(self.twins):
             return None
-        k = int(self.twin[int(i)])
-        if k not in self._twin_cache:
-            if len(self._twin_cache) > 400:
+        k = int(self.twins[t]["idx"][int(i)])
+        if k < 0:
+            return None
+        return os.path.join(self.root, self.twins[t]["dir"], "frames", f"{k:05d}.jpg")
+
+    def twin_image(self, i: int, t: int = 0):
+        path = self._twin_path(i, t)
+        return None if path is None else np.asarray(Image.open(path).convert("RGB"))
+
+    def twin_features(self, i: int, t: int = 0):
+        """Extra-view features for node i from view set t, or None where it has none."""
+        from .bearing import features
+        path = self._twin_path(i, t)
+        if path is None:
+            return None
+        if path not in self._twin_cache:
+            if len(self._twin_cache) > 600:
                 self._twin_cache.clear()
-            img = np.asarray(Image.open(os.path.join(self.root, "twin", "frames", f"{k:05d}.jpg")).convert("RGB"))
-            self._twin_cache[k] = features(img)
-        return self._twin_cache[k]
+            self._twin_cache[path] = features(np.asarray(Image.open(path).convert("RGB")))
+        return self._twin_cache[path]
 
     def node_at_p(self, p: float) -> int:
         return int(np.clip(np.searchsorted(self.p, p), 0, len(self.p) - 1))

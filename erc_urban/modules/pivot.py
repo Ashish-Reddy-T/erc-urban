@@ -30,7 +30,19 @@ class PulsePivot:
         aim: float = 0.75,
         tol_deg: float = 22.0,
         ang_floor: float = 0.25,
+        exact_bursts: bool = False,
+        boost_step: float = 0.2,
+        max_ang: float = 1.0,
     ):
+        # True when a CommandStreamer ends each burst at exactly its planned
+        # duration (see burst_remaining), rather than at the next loop tick.
+        self.exact_bursts = exact_bursts
+        # A burst that turns the rover < 2 deg (roots, a slope, soft dirt:
+        # Panama) raises the command by boost_step x for the next one, up to
+        # max_ang; a responsive burst eases it back by half a step.
+        self.boost_step = boost_step
+        self.max_ang = max_ang
+        self.boost = 1.0
         self.ang = ang
         # Stiction floor: below this the tracks do not break loose at all.
         self.ang_floor = min(ang_floor, ang)
@@ -79,6 +91,12 @@ class PulsePivot:
         self._yaw0 = None
         self._ts0 = None
 
+    def burst_remaining(self, now: float) -> float:
+        """Seconds left in the current burst; 0 outside one."""
+        if self._phase != "burst":
+            return 0.0
+        return max(0.0, self._burst_end - now)
+
     def command(self, err_deg: float, tel, now: float) -> tuple[float, float, str]:
         """
         err_deg: bearing error, left-positive, degrees.
@@ -89,7 +107,11 @@ class PulsePivot:
                 return 0.0, self._cmd_ang, f"burst {self._burst_end - now:.1f}s"
             # Real length, not requested: the loop tick quantises it upward and
             # learning from the requested value biases the rate estimate.
+            # Unless a command streamer cut it off on time (exact_bursts), in
+            # which case the loop's lateness is not rotation.
             self._actual = max(now - self._burst_start, 1e-3)
+            if self.exact_bursts:
+                self._actual = min(self._actual, self._dur)
             self._phase = "settle"
             self._settle_end = now + self.settle_s
             return 0.0, 0.0, "burst done"
@@ -124,6 +146,7 @@ class PulsePivot:
         else:
             dur = self.min_burst
             mag = max(self.ang_floor, self.ang * need / min_turn_full)
+        mag = min(self.max_ang, mag * self.boost)
         direction = 1.0 if err_deg >= 0.0 else -1.0
         self._cmd_ang = direction * mag
         self._mag = mag
@@ -160,8 +183,11 @@ class PulsePivot:
         moved = abs(wrap180(np.degrees(tel.yaw) - np.degrees(self._yaw0)))
         if moved < 2.0:
             # No response: keep the prior rather than learn a rate of zero,
-            # which would make every future burst hit max_burst.
+            # which would make every future burst hit max_burst. Push harder.
+            if self._mag < self.max_ang:
+                self.boost = min(self.max_ang / max(self.ang, 1e-6), self.boost + self.boost_step)
             return
+        self.boost = max(1.0, self.boost - 0.5 * self.boost_step)
         # Normalise back to the rate at full command, since weak bursts use a
         # reduced magnitude.
         measured = (moved / self._actual) * (self.ang / max(self._mag, 1e-6))

@@ -6,7 +6,7 @@
   "cx": 512.0,
   "cy": 288.0,
   "height_m": 0.148,
-  "pitch_rad": 0.05235987755982989,
-  "source": "spin360_loop_closure",
-  "notes": "fx/FOV measured on the live Mini+ by closing a 360 deg in-place spin (48 frames, 226-inlier loop closure); fx=330-350px -> ~113 deg, vs the 90 deg previously assumed everywhere (1.5x error). pitch from RANSAC ground plane at this fx. height_m 0.148 from the official MINI+ dimension drawing (195 mm body, 148 mm to camera centre; 250x190 mm footprint, 160 mm wheelbase). Lens shows visible barrel distortion, so pinhole degrades near the frame edges."
+  "pitch_rad": -0.041153222641442964,
+  "source": "spin360_loop_closure + floor_horizon (indoor NYU unit, confirmed on Wuhan luke-notch-quirk)",
+  "notes": "fx/FOV measured on the live Mini+ by closing a 360 deg in-place spin (48 frames, 226-inlier loop closure); fx=330-350px -> ~113 deg, vs the 90 deg previously assumed everywhere (1.5x error). height_m 0.148 from the official MINI+ dimension drawing (195 mm body, 148 mm to camera centre; 250x190 mm footprint, 160 mm wheelbase). Lens shows visible barrel distortion, so pinhole degrades near the frame edges. | PITCH (2026-09-23): the earlier 3 deg DOWN (from a RANSAC ground plane, horizon row 270) was wrong. Indoor unit: SegFormer floor ends at rows 150-155 of 288 over 60+ corridor frames -> horizon ~row 302, camera ~2.4 deg UP. Wuhan plaza, 6 frames: ground ends at row 154 of 288 (308 of 576) with the far kerb ~15-20 m out, i.e. horizon ~row 303-305. Same bot model on every track. With 3 deg down every ground distance was ~2x short, and the depth response fit, calibrated against that geometry, capped depth at ~2.4 m and put the far horizon 1.3 m away as a phantom costmap obstacle."
 }

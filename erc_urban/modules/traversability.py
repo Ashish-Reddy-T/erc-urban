@@ -122,6 +122,7 @@ class TraversabilityVeto:
         mask_hw: tuple[int, int] = (120, 160),
         samples_per_segment: int = 4,
         min_traversable_frac: float = 0.02,
+        max_range_m: Optional[float] = 4.0,
     ):
         """
         max_bad_frac: veto once this fraction of sampled points land on bad
@@ -137,7 +138,15 @@ class TraversabilityVeto:
             confident nonsense mask, not a cautious one (SegFormer labels one
             fixture 100% "sky", another 84% "wall"), and vetoing everything on
             that hands run.py a spurious "no way forward".
+        max_range_m: only the part of each path within this range is tested.
+            Under a 148 mm camera, ground past ~4 m projects within ~2 rows of
+            the horizon in a 120-row mask, onto whatever stands at the far edge
+            of the visible ground, so a 10 m anchor was vetoed by a wall 9 m
+            away and "all untraversable" fired escapes long before anything
+            was near. The veto re-runs every tick; the far part gets tested
+            once the rover is there. None = the whole path.
         """
+        self.max_range_m = max_range_m
         self.source = source if source is not None else SegFormerSource()
         self.calib = calib
         self.max_bad_frac = max_bad_frac
@@ -196,6 +205,8 @@ class TraversabilityVeto:
         for i, c in enumerate(cands):
             pts = self._densify(np.asarray(c.waypoints, dtype=np.float64),
                                 self.samples_per_segment)
+            if self.max_range_m is not None:
+                pts = pts[np.linalg.norm(pts, axis=1) <= self.max_range_m]
             uv, ok = cal.project_ground(pts)
             u = np.rint(uv[:, 0]).astype(int)
             v = np.rint(uv[:, 1]).astype(int)

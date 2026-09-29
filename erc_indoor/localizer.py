@@ -16,6 +16,7 @@ erase the true position.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,6 +44,7 @@ class RouteLocalizer:
         sigma_base_m: float = 0.15,
         sigma_frac: float = 0.15,
         uniform_mix: float = 1e-5,
+        vis_weight: float = float(os.environ.get("LOC_VIS_W", 0.25)),
     ):
         self.route = route
         self.p = route.p.astype(np.float64)
@@ -52,6 +54,7 @@ class RouteLocalizer:
         self.sigma_base_m = sigma_base_m
         self.sigma_frac = sigma_frac
         self.uniform_mix = uniform_mix
+        self.vis_weight = vis_weight
         self.b = np.full(len(self.p), 1.0 / len(self.p))
         self.last_sims: np.ndarray | None = None
 
@@ -82,12 +85,18 @@ class RouteLocalizer:
 
     def update(self, desc: np.ndarray) -> None:
         sims = self.D @ desc
-        if getattr(self.route, "twin_desc", None) is not None:
-            # best of the day and night picture of each place
-            sims = np.maximum(sims, self.route.twin_desc @ desc)
+        for tw in getattr(self.route, "twins", []):
+            # best of all pictures of each place (day, night, other laps)
+            sims = np.maximum(sims, tw["desc"] @ desc)
         self.last_sims = sims
         lik = np.exp((sims - sims.max()) / self.tau) + self.lik_floor
-        b = self.b * lik
+        # Frames 0.25 s apart are nearly the same picture; at full weight the
+        # same weak evidence is counted many times over and outvotes the
+        # wheels (dawn run 2026-09-26: the estimate stalled at s~26-30 for
+        # ~9 m of wheel travel and turn 1 fired ~4 m late, under the piano).
+        # Replayed offline: weight 0.25 fixed that run and left every corner
+        # of the night full lap within 0.7 m of where it was taken.
+        b = self.b * lik ** self.vis_weight
         self.b = b / b.sum()
 
     def constrain(self, lo: float, hi: float, floor: float = 1e-9) -> None:

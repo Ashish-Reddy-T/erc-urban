@@ -42,7 +42,7 @@ def _env(name: str, default: float) -> float:
 
 
 # ---- tuning (env-overridable, like erc_urban/run.py) -------------------------
-V_NOM = _env("V_NOM", 0.45)            # linear cmd; live probe: 0.55 peaks at 0.69 m/s
+V_NOM = _env("V_NOM", 0.35)            # linear cmd; live probe: 0.55 peaks at 0.69 m/s. 0.45 felt too fast past the tables (2 s lag)
 V_SLOW = _env("V_SLOW", 0.30)
 # Live run 1: rolling yaw response ~20-25 deg/s per unit angular, seen ~2 s
 # after the command (frame age + actuation). KP 0.012 oscillated +-35 deg
@@ -67,7 +67,13 @@ TURN_LEAD_M = _env("TURN_LEAD_M", 0.2)
 TURN_TOL_DEG = _env("TURN_TOL_DEG", 7.0)
 TURN_AIM = _env("TURN_AIM", 0.8)       # undershoot each pulse; overshoot costs a settle
 TURN_FIRST_FRAC = _env("TURN_FIRST_FRAC", 0.65)
-TURN_NOMINAL_MIN_DEG = _env("TURN_NOMINAL_MIN_DEG", 75.0)   # every corner is ~90 deg
+# Every corner is a right angle. Lap g6 (2026-09-26, data-stem-cell): SIFT
+# right after turns 1 and 3 showed ~94 and ~100 deg were needed; the stored
+# 80 / 50 come from the old lap's under-sampled gyro.
+TURN_NOMINAL_MIN_DEG = _env("TURN_NOMINAL_MIN_DEG", 90.0)
+# A weak (DINO-only) lock may end a turn only if it agrees with the gyro:
+# turn 1 of g6 stopped at +69 of 90 on a DINO lock at margin 0.14.
+TURN_WEAK_LOCK_AGREE_DEG = _env("TURN_WEAK_LOCK_AGREE_DEG", 15.0)
 TURN_MAX_PULSES = int(_env("TURN_MAX_PULSES", 12))
 # Run 8, turn 4: a 2.5 s open-loop pulse spun faster than the 25 deg/s prior,
 # no visual lock at night, then 4 more search pulses -> ~150 deg for a ~105
@@ -129,6 +135,11 @@ ESCAPE_ARC_S = _env("ESCAPE_ARC_S", 1.6)
 ESCAPE_ARC_LIN = _env("ESCAPE_ARC_LIN", 0.30)
 ESCAPE_ARC_ANG = _env("ESCAPE_ARC_ANG", 0.35)
 ESCAPE_MAX_SWING_DEG = _env("ESCAPE_MAX_SWING_DEG", 60.0)
+# After a reverse, ALWAYS arc toward the side that was clearer when it stopped.
+# Lap g9: thin stool legs look like open floor once the rover has backed off,
+# so "clear ahead -> resume" drove it into the same stool 11 times in a row.
+ESCAPE_SIDE_DEG = _env("ESCAPE_SIDE_DEG", 25.0)
+ESCAPE_RESET_M = _env("ESCAPE_RESET_M", 1.5)   # escape count resets only after this much wheel progress
 MAX_ESCAPES = int(_env("MAX_ESCAPES", 4))
 BOXED_WAIT_S = _env("BOXED_WAIT_S", 4.0)      # then reset and try again
 BOXED_RETRIES = int(_env("BOXED_RETRIES", 3))
@@ -142,7 +153,40 @@ GAP_ALIGN_DEG = _env("GAP_ALIGN_DEG", 8.0)    # rotate to face a gap this far of
 # chooses which opening.
 CORRIDOR_FAR_M = _env("CORRIDOR_FAR_M", 3.0)      # far floor must reach this
 CORRIDOR_MAX_OPEN_BINS = int(_env("CORRIDOR_MAX_OPEN_BINS", 9))   # <=~45 deg of open floor = corridor
-CORRIDOR_MAX_DEV = _env("CORRIDOR_MAX_DEV", 35.0)  # far direction must be this close to teach heading
+CORRIDOR_MAX_DEV = _env("CORRIDOR_MAX_DEV", 15.0)  # far direction must be this close to the planned heading
+# Lap g9: in the open piano area just after corner 1, "farthest floor" points
+# diagonally back across the atrium; at 35 deg allowed deviation corridor
+# following pulled the rover ~20 deg further left every tick (seen as a U-turn).
+CORRIDOR_AFTER_TURN_M = _env("CORRIDOR_AFTER_TURN_M", 3.0)   # no corridor steering this soon after a corner
+
+# ---- wheel-distance band --------------------------------------------------------
+# The rover cannot be further along than its wheels turned (they over-read on
+# slip and weaving, never under-read), nor far behind. Since the start / the
+# last corner, progress is kept within [LO_FRAC*w - LO_M, HI_FRAC*w + HI_M] of
+# wheel distance w. Run g5 (2026-09-26): folding tables seen at s~10 matched
+# the new lap's views at s~20 and the estimate jumped 10 m ahead in 3 s.
+# Replayed on all of that day's runs and the night lap: no corner moved.
+# Map metres per wheel metre on each straight (start->corner 1, 1->2, 2->3,
+# 3->4), measured on three full laps and both rovers: 0.84-0.85, 0.89-0.91,
+# 0.95-0.99, 0.92-0.93. Wheel distance placed corner 1 within ~1 m on every
+# lap, while the camera estimate ran 3-5 m late on three of them (the corridor
+# to the piano looks the same from 26 m and 31 m). So the band is centred on
+# calibrated wheel distance w*r, +-(BAND_M + BAND_FRAC*w), and a corner is
+# also taken when calibrated wheel distance reaches it (_wheel_says_corner).
+WHEEL_RATIO = [float(x) for x in os.environ.get("WHEEL_RATIO", "0.86,0.88,0.935,0.90").split(",")]
+BAND_M = _env("BAND_M", 1.5)
+BAND_FRAC = _env("BAND_FRAC", 0.05)
+WHEEL_CORNER_LEAD_M = _env("WHEEL_CORNER_LEAD_M", 0.3)
+
+# ---- keep off things beside the path -------------------------------------------
+# Heading hold keeps the teach HEADING, not the teach line: started beside the
+# bar stools, the rover rolled past them ~0.2 m away. Obstacle feet within
+# SIDE_LOOK_M ahead and SIDE_BAND_M to a side push the heading away and slow down.
+SIDE_LOOK_M = _env("SIDE_LOOK_M", 1.5)
+SIDE_BAND_M = _env("SIDE_BAND_M", 0.8)
+SIDE_GAP_M = _env("SIDE_GAP_M", 0.35)             # wanted gap beside the body
+SIDE_MAX_DEG = _env("SIDE_MAX_DEG", 10.0)
+BODY_HALF_M = _env("BODY_HALF_M", 0.10)
 
 # ---- never drive blind ------------------------------------------------------
 DINO_MIN_MARGIN = _env("DINO_MIN_MARGIN", 0.10)   # 0.08 let it follow a wrong-way view (resumed run)
@@ -156,6 +200,38 @@ SEARCH_TURN_LEAD_M = _env("SEARCH_TURN_LEAD_M", 2.0)
 # ~1.2 s of dead time does not turn steering into a limit cycle.
 HEADING_ALPHA = _env("HEADING_ALPHA", 0.5)
 ANG_RATE_LIMIT = _env("ANG_RATE_LIMIT", 0.10)
+
+# ---- gyro heading hold ------------------------------------------------------
+# Dawn run (2026-09-26): vision matched weakly (people at the tables, grey
+# light), flipped +20/-19 deg and dropped out, and the blind rule spun the
+# rover off the route at s=20. Vision and gyro agreed throughout. So steer on
+# the gyro against the teach lap's own yaw, and let every confident visual
+# match re-anchor the offset between the two (the teach yaw drifts ~1 deg/m
+# in places, so the offset is kept local).
+GYRO_HEAD = _env("GYRO_HEAD", 1.0) > 0
+FRAME_LAG_S = _env("FRAME_LAG_S", 1.0)            # the frame shows the heading ~this long ago
+YOFF_ALPHA_SIFT = _env("YOFF_ALPHA_SIFT", 0.35)
+YOFF_ALPHA_DINO = _env("YOFF_ALPHA_DINO", 0.15)
+YOFF_GATE_DEG = _env("YOFF_GATE_DEG", 25.0)       # visual samples this far off the gyro are outliers...
+YOFF_FLIP_N = int(_env("YOFF_FLIP_N", 6))         # ...unless this many in a row agree with each other
+DINO_FIX_MAX_DEG = _env("DINO_FIX_MAX_DEG", 8.0)
+GYRO_BLIND_M = _env("GYRO_BLIND_M", 40.0)         # gyro drifts only a few deg per 50 m (lap g7); DINO-only is the weaker fallback
+TEACH_YAW_SMOOTH = int(_env("TEACH_YAW_SMOOTH", 15))   # half-window, nodes
+
+
+# ---- steering delay predictor ---------------------------------------------------
+# Morning run 2026-09-26: ang -> gyro yaw-rate peaks ~2 s later (actuation +
+# telemetry), at ~65 deg/s per unit ang (night lap: ~45). Measured error is
+# therefore ~2 s stale, and KP+KI weaved +-30 deg with a ~12 s period (a
+# simulation of that loop reproduces it). Add the turning already commanded
+# but not yet visible in the measurement (a Smith predictor).
+PRED_DELAY_S = _env("PRED_DELAY_S", 2.0)
+PRED_GAIN = _env("PRED_GAIN", 55.0)               # deg/s per unit ang
+I_BAND_DEG = _env("I_BAND_DEG", 6.0)              # integrate only near zero (no wind-up)
+
+
+def _wrap(a: float) -> float:
+    return (a + 180.0) % 360.0 - 180.0
 
 
 @dataclass
@@ -206,6 +282,7 @@ class NavLog:
     ahead_m: Optional[float] = None
     avoid_deg: Optional[float] = None
     corridor_deg: Optional[float] = None
+    gyro_err: Optional[float] = None
 
 
 class Navigator:
@@ -233,6 +310,8 @@ class Navigator:
         self._boxed_since = None
         self._boxed_cycles = 0
         self._escape_end_t = -1e9
+        self._escape_end_s = -1e9
+        self._escape_side = 1.0
         self._escape_yaw0 = 0.0
         self._arc_ang = 0.0
         self._finish_odo0 = 0.0
@@ -266,6 +345,15 @@ class Navigator:
         self._prog_hist: list = []            # (now, odo_s, visual s, image diff) while DRIVE
         self._thumb = None
         self._passed_cps: set[str] = set()
+        # gyro heading hold
+        self._yaw_hist: list = []            # (now, yaw_total)
+        self._yoff: Optional[float] = None   # live gyro yaw minus teach yaw
+        self._yoff_n = 0
+        self._yoff_s = 0.0                   # odometer s at the last visual fix
+        self._yoff_out: list = []            # consecutive outlier samples
+        self._teach_yaw = self._smooth_teach_yaw()
+        self._cmd_hist: list = []            # (now, ang) of every command issued
+        self._band: Optional[tuple[float, float]] = None   # (anchor p, odometer s there)
 
     # ---- helpers -------------------------------------------------------------
     def _say(self, msg: str) -> None:
@@ -290,27 +378,117 @@ class Navigator:
         dp = ds + (TURN_M_PER_DEG * abs(dyaw) if turning else 0.0)
         return float(np.clip(dp, -V_PHYS_MAX * dt, V_PHYS_MAX * dt + TURN_M_PER_DEG * 60.0 * dt))
 
+    def _wheel_ratio(self) -> float:
+        k = min(self.turn_k, len(WHEEL_RATIO) - 1)
+        return WHEEL_RATIO[k]
+
+    def _wheel_says_corner(self, obs: Obs, t) -> bool:
+        """Calibrated wheel distance since the start / last corner has reached
+        the next corner (the camera estimate may lag on corridor approaches)."""
+        if self._band is None:
+            return False
+        p0, o0 = self._band
+        p_wheel = p0 + self._wheel_ratio() * (obs.s_total - o0)
+        return p_wheel >= float(self.route.p[t.start]) - WHEEL_CORNER_LEAD_M
+
+    def _smooth_teach_yaw(self) -> np.ndarray:
+        """Teach yaw, box-smoothed within each straight (not across corners)."""
+        y = np.asarray(self.route.yaw, dtype=float).copy()
+        out = y.copy()
+        edges = [0]
+        for t in self.route.turns:
+            edges += [t.start, t.end]
+        edges.append(len(y))
+        w = TEACH_YAW_SMOOTH
+        for a, b in zip(edges[0::2], edges[1::2]):
+            for i in range(a, b):
+                lo, hi = max(a, i - w), min(b, i + w + 1)
+                out[i] = y[lo:hi].mean()
+        return out
+
+    def _yaw_at(self, t: float) -> Optional[float]:
+        h = self._yaw_hist
+        if not h:
+            return None
+        if t <= h[0][0]:
+            return h[0][1]
+        for (t0, y0), (t1, y1) in zip(h, h[1:]):
+            if t0 <= t <= t1:
+                return y0 + (y1 - y0) * (t - t0) / max(t1 - t0, 1e-6)
+        return h[-1][1]
+
+    def _gyro_fix(self, obs: Obs, ref: int, e: float, sift: bool) -> None:
+        """A visual heading error to teach node `ref` corrects the gyro offset.
+
+        Only SIFT (many agreeing matches) may move it far or re-anchor it. A
+        DINO-only fix may nudge it by <= DINO_FIX_MAX_DEG: lap g7 (2026-09-26)
+        re-anchored on a DINO fix at margin 0.10 right after corner 2, then held
+        the wrong heading with confidence — in the plain white corridors DINO
+        says "~0 deg" whichever way the rover faces — and doubled back ~150 deg."""
+        y_then = self._yaw_at(obs.now - FRAME_LAG_S)
+        if y_then is None:
+            return
+        sample = y_then - float(self._teach_yaw[ref]) - e
+        if self._yoff is None:
+            if sift:
+                self._yoff, self._yoff_n, self._yoff_s = sample, 1, obs.s_total
+            return
+        r = _wrap(sample - self._yoff)
+        if not sift:
+            if abs(r) <= DINO_FIX_MAX_DEG:
+                self._yoff += YOFF_ALPHA_DINO * r
+                self._yoff_s = obs.s_total
+            return
+        if abs(r) > YOFF_GATE_DEG and self._yoff_n >= 3:
+            self._yoff_out.append(sample)
+            if len(self._yoff_out) >= YOFF_FLIP_N:
+                o = np.array(self._yoff_out)
+                if float(np.ptp(o)) < YOFF_GATE_DEG:
+                    self._say(f"[gyro] SIFT disagrees persistently — re-anchoring offset "
+                              f"{self._yoff:+.0f} -> {float(np.median(o)):+.0f}")
+                    self._yoff = float(np.median(o))
+                    self._yoff_n = 1
+                self._yoff_out = []
+            return
+        a = YOFF_ALPHA_SIFT if self._yoff_n >= 3 else 0.5
+        self._yoff += a * r
+        self._yoff_n += 1
+        self._yoff_out = []
+        self._yoff_s = obs.s_total
+
+    def _gyro_err(self, obs: Obs, ref: int) -> Optional[float]:
+        """Heading error from the gyro (deg, + = live points LEFT of teach), or
+        None when there is no recent visual fix to trust it by."""
+        if not GYRO_HEAD or self._yoff is None:
+            return None
+        if obs.s_total - self._yoff_s > GYRO_BLIND_M:
+            return None
+        return _wrap(obs.yaw_total - self._yoff - float(self._teach_yaw[ref]))
+
     def _bearing_to(self, live_feat, node: int) -> Bearing:
         """Day and night picture of the node; the one with more agreeing matches
         wins. (Live run 1: at night the day view sometimes passed on ~20
         ceiling-light matches and disagreed with the night view by ~12 deg.)"""
         b = bearing(live_feat, self.route.features(node))
         self.log.ref_src = "day"
-        tf = self.route.twin_features(node)
-        if tf is not None:
+        for t in range(self.route.n_twins):
+            tf = self.route.twin_features(node, t)
+            if tf is None:
+                continue
             bt = bearing(live_feat, tf)
             if bt.n_inliers > b.n_inliers:
                 b = bt
-                self.log.ref_src = "night"
+                self.log.ref_src = self.route.twin_name(t)
         self.log.ref = node
         self.log.yaw_err = b.yaw_err_deg if b.ok else None
         self.log.inliers = b.n_inliers
         return b
 
-    def _ref_tokens(self, node: int, night: bool):
-        key = (int(node), night)
+    def _ref_tokens(self, node: int, t: int):
+        """DINO patch tokens of node's picture: t=-1 the day map, t>=0 extra view set t."""
+        key = (int(node), t)
         if key not in self._tok_cache:
-            img = self.route.twin_image(node) if night else self.route.image(node)
+            img = self.route.twin_image(node, t) if t >= 0 else self.route.image(node)
             if img is None:
                 return None
             if len(self._tok_cache) > 300:
@@ -331,15 +509,16 @@ class Navigator:
             self.log.head_src = ""
             return None
         best = None
-        for night in (False, True):
-            rt = self._ref_tokens(node, night)
+        for t in [-1] + list(range(self.route.n_twins)):
+            rt = self._ref_tokens(node, t)
             if rt is None:
                 continue
             e, m = dino_shift(self._live_tok, rt)
             if best is None or m > best[1]:
-                best = (e, m, night)
+                best = (e, m, t)
         if best is not None and best[1] >= dino_min:
-            self.log.head_src = f"dino-{'night' if best[2] else 'day'}({best[1]:.2f})"
+            name = self.route.twin_name(best[2]) if best[2] >= 0 else "day"
+            self.log.head_src = f"dino-{name}({best[1]:.2f})"
             self.log.yaw_err = best[0]
             return best[0]
         self.log.head_src = ""
@@ -411,8 +590,27 @@ class Navigator:
 
     # ---- main ----------------------------------------------------------------
     def step(self, obs: Obs) -> Cmd:
+        cmd = self._step(obs)
+        self._cmd_hist.append((obs.now, float(cmd.ang)))
+        self._cmd_hist = [h for h in self._cmd_hist if obs.now - h[0] <= PRED_DELAY_S + 1.0]
+        return cmd
+
+    def _pending_turn(self, now: float) -> float:
+        """Degrees (left +) commanded over the last PRED_DELAY_S that the
+        measurement cannot show yet."""
+        h = self._cmd_hist
+        tot = 0.0
+        for (t0, a), t1 in zip(h, [x[0] for x in h[1:]] + [now]):
+            lo = max(t0, now - PRED_DELAY_S)
+            if t1 > lo:
+                tot += a * (t1 - lo)
+        return PRED_GAIN * tot
+
+    def _step(self, obs: Obs) -> Cmd:
         dp = self._odom_progress(obs)
         self._prev = obs
+        self._yaw_hist.append((obs.now, obs.yaw_total))
+        self._yaw_hist = [h for h in self._yaw_hist if obs.now - h[0] <= 4.0]
         self.loc.predict(dp)
 
         in_burst = self._pulse is not None and obs.now < self._pulse.burst_end
@@ -423,6 +621,12 @@ class Navigator:
             self.loc.update(desc)
         if self.mode != "INIT":
             self.loc.constrain(*self._window())
+        if self._band is not None and self.mode != "TURN":
+            p0, o0 = self._band
+            w = obs.s_total - o0
+            c = p0 + self._wheel_ratio() * w
+            m = BAND_M + BAND_FRAC * abs(w)
+            self.loc.constrain(c - m, c + m)
         est = self.loc.estimate()
         lead = max(obs.v, 0.0) * LATENCY_S
         p_now = est.p + lead
@@ -442,6 +646,11 @@ class Navigator:
             while (self.turn_k < len(self.route.turns)
                    and p_ref > self.route.p[self.route.turns[self.turn_k].end]):
                 self.turn_k += 1
+            self._band = (self.start_p if self.start_p is not None else float(self.route.p[0]), obs.s_total)
+            if GYRO_HEAD and self.start_p is None:
+                # the operator places the rover at the cone facing down the route
+                self._yoff = obs.yaw_total - float(self._teach_yaw[est.node])
+                self._yoff_n, self._yoff_s = 0, obs.s_total
             self._say(f"[nav] start localized at node {est.node} s={est.s:.1f} spread={est.spread_m:.1f}; "
                       f"next corner {self.turn_k + 1}/{len(self.route.turns)}")
 
@@ -513,6 +722,10 @@ class Navigator:
             t = self.route.turns[self.turn_k]
             if p_now >= self.route.p[t.start] - TURN_LEAD_M:
                 return self._turn_enter(obs, est, t)
+            if self._wheel_says_corner(obs, t):
+                self._say(f"[nav] wheel distance reached corner {self.turn_k + 1} "
+                          f"(camera estimate s={est.s:.1f}) — turning")
+                return self._turn_enter(obs, est, t)
 
         # --------------------------------------------------------------- cones
         if self.cones is not None and obs.frame is not None:
@@ -538,7 +751,21 @@ class Navigator:
         ref = min(self.route.node_at_p(est.p + LOOKAHEAD_M), cap)
         if obs.frame is None:
             return Cmd(0.0, 0.0, 0.3, "DRIVE", "no frame")
-        e = self._heading(features(obs.frame), ref)
+        e_vis = self._heading(features(obs.frame), ref)
+        if e_vis is not None and GYRO_HEAD:
+            self._gyro_fix(obs, ref, e_vis, self.log.head_src.startswith("sift"))
+        # teach yaw inside a corner is mid-rotation: after a corner, measure
+        # against the straight that follows it (run g1: the estimate slid back
+        # into turn 1, the mid-turn yaw said "54 deg too far left", and the
+        # rover turned back toward the piano)
+        gref = ref
+        if self.turn_k > 0:
+            gref = max(gref, self.route.turns[self.turn_k - 1].end + 3)
+        e_gyro = self._gyro_err(obs, gref)
+        self.log.gyro_err = e_gyro
+        e = e_gyro if e_gyro is not None else e_vis
+        if e_gyro is not None:
+            self.log.head_src = (self.log.head_src + "+gyro") if e_vis is not None else "gyro"
 
         # corridor/avoid guides are per-tick; clear stale ones for the overlay
         self.log.corridor_deg = None
@@ -565,12 +792,15 @@ class Navigator:
         else:
             self._blind = 0
 
+        if e is not None:
+            e = e + self._pending_turn(obs.now)      # where the heading is about to be
         want = -e if e is not None else 0.0          # deg to turn, left-positive
         corridor = None
         if fs is not None:
             far = float(fs.clear_m.max())
             n_open = int((fs.clear_m >= CORRIDOR_FAR_M).sum())
-            if far >= CORRIDOR_FAR_M and 0 < n_open <= CORRIDOR_MAX_OPEN_BINS:
+            since_turn = obs.s_total - self._band[1] if (self._band is not None and self.turn_k > 0) else 1e9
+            if far >= CORRIDOR_FAR_M and 0 < n_open <= CORRIDOR_MAX_OPEN_BINS and since_turn >= CORRIDOR_AFTER_TURN_M:
                 cand = fs.bins_deg[fs.clear_m >= 0.9 * far]
                 cand = cand[np.abs(cand - want) <= CORRIDOR_MAX_DEV]
                 if len(cand):
@@ -578,6 +808,23 @@ class Navigator:
         if corridor is not None:
             want = corridor
         self.log.corridor_deg = corridor
+        # keep off obstacles beside the path
+        side_close = False
+        if fs is not None and fs.pts is not None and len(fs.pts):
+            P = np.asarray(fs.pts)
+            near = P[(P[:, 0] > 0.05) & (P[:, 0] < SIDE_LOOK_M) & (np.abs(P[:, 1]) < SIDE_BAND_M)
+                     & (np.abs(P[:, 1]) > BODY_HALF_M + 0.05)]     # in-path points are AVOID's job
+            gl = float(near[near[:, 1] > 0, 1].min()) - BODY_HALF_M if (near[:, 1] > 0).any() else 9.0
+            gr = float(-near[near[:, 1] < 0, 1].max()) - BODY_HALF_M if (near[:, 1] < 0).any() else 9.0
+            push = 0.0
+            if gl < SIDE_GAP_M:
+                push -= SIDE_MAX_DEG * (SIDE_GAP_M - gl) / SIDE_GAP_M
+            if gr < SIDE_GAP_M:
+                push += SIDE_MAX_DEG * (SIDE_GAP_M - gr) / SIDE_GAP_M
+            push = float(np.clip(push, -SIDE_MAX_DEG, SIDE_MAX_DEG))
+            if abs(push) > 0.5:
+                want += push
+            side_close = min(gl, gr) < SIDE_GAP_M
         avoiding = False
         if fs is not None and fs.clear_at(want) < NEED_M:
             alt = self.free.steer(fs, want, NEED_M)
@@ -605,7 +852,7 @@ class Navigator:
         elif e is not None:
             self._c_f = None
             self._e_f = e if self._e_f is None else HEADING_ALPHA * e + (1 - HEADING_ALPHA) * self._e_f
-            if self._i_t is not None:
+            if self._i_t is not None and abs(self._e_f) < I_BAND_DEG:
                 dt = min(obs.now - self._i_t, 0.5)
                 self._i_term = float(np.clip(self._i_term - KI_DEG * self._e_f * dt, -I_MAX, I_MAX))
             self._i_t = obs.now
@@ -614,7 +861,7 @@ class Navigator:
             ang = 0.5 * self._last_ang
 
         lin = max(LIN_MIN, V_NOM * float(np.clip(1.0 - abs(want) / 45.0, 0.4, 1.0)))
-        if est.spread_m > 3.0 or (e is None and corridor is None) or avoiding:
+        if est.spread_m > 3.0 or (e is None and corridor is None) or avoiding or side_close:
             lin = min(lin, V_SLOW)
         if self.turn_k < len(self.route.turns):
             to_corner = self.route.p[self.route.turns[self.turn_k].start] - (est.p + max(obs.v, 0) * LATENCY_S)
@@ -645,8 +892,11 @@ class Navigator:
             return self._begin_escape(obs, "no wheel progress")
 
         self._last_ang = ang
-        self._escapes = 0 if (fs is None or fs.ahead_m > NEED_M) else self._escapes
+        if obs.s_total - self._escape_end_s > ESCAPE_RESET_M:
+            self._escapes = 0
         note = (f"ref {ref} err {e:+.1f} {self.log.head_src}" if e is not None else f"ref {ref} no-heading x{self._blind}")
+        if e_gyro is not None and e_vis is not None:
+            note += f" (vis {e_vis:+.0f})"
         if corridor is not None:
             note += f" CORRIDOR->{corridor:+.0f}"
         if avoiding:
@@ -684,10 +934,18 @@ class Navigator:
         self._escape_phase = "stop"
         self._escape_until = obs.now + ESCAPE_SETTLE_S
         self._escapes += 1
+        # which side had more room when we stopped (the frame that saw the obstacle)
+        self._escape_side = 1.0
+        if self.last_fs is not None and obs.now - self.last_fs[1] < 2.0:
+            fs0 = self.last_fs[0]
+            left = float(np.mean(fs0.clear_m[(fs0.bins_deg >= 10) & (fs0.bins_deg <= 45)]))
+            right = float(np.mean(fs0.clear_m[(fs0.bins_deg <= -10) & (fs0.bins_deg >= -45)]))
+            self._escape_side = 1.0 if left >= right else -1.0
         self._e_f = self._c_f = None
         self._i_term, self._i_t = 0.0, None
         self._last_ang = 0.0
-        self._say(f"[obstacle] {why} — stop (escape #{self._escapes})")
+        self._say(f"[obstacle] {why} — stop (escape #{self._escapes}, will arc "
+                  f"{'left' if self._escape_side > 0 else 'right'})")
         return Cmd(0.0, 0.0, 0.3, "ESCAPE", why)
 
     def _escape(self, obs: Obs, est) -> Cmd:
@@ -700,6 +958,7 @@ class Navigator:
 
         if self._escape_phase == "arc":            # arc finished: back to normal driving
             self._escape_end_t = obs.now
+            self._escape_end_s = obs.s_total
             self._boxed_cycles = 0
             self.mode = "DRIVE"
             self._move_ref = None
@@ -723,7 +982,8 @@ class Navigator:
         lo, hi = -ESCAPE_MAX_SWING_DEG - swung, ESCAPE_MAX_SWING_DEG - swung
         want = float(np.clip(want, lo, hi))
 
-        if fs.ahead_m >= NEED_M and abs(want) < 10:
+        if self._escape_phase == "stop" and fs.ahead_m >= NEED_M and abs(want) < 10:
+            # the obstacle is gone (a person walked off) — no need to back off
             self.mode = "DRIVE"
             self._move_ref = None
             return Cmd(0.0, 0.0, 0.3, "DRIVE", f"escape done, {fs.ahead_m:.1f} m clear")
@@ -738,7 +998,22 @@ class Navigator:
             self._say(f"[obstacle] reversing {ESCAPE_REVERSE_S:.1f} s (ahead {fs.ahead_m:.2f} m)")
             return Cmd(-ESCAPE_REVERSE_LIN, 0.0, 0.6, "ESCAPE", "reversing")
 
-        # 2) after reversing: arc forward toward the clear heading nearest the route
+        # 2) after reversing: arc forward to the side that had more room, never
+        #    straight back at the same obstacle
+        alt = None
+        if self._escape_phase == "look":
+            for side in (self._escape_side, -self._escape_side):
+                cand = float(np.clip(side * ESCAPE_SIDE_DEG + 0.3 * want, lo, hi))
+                if abs(cand) >= 10 and fs.clear_at(cand) >= STOP_M + 0.3:
+                    alt = cand
+                    break
+        if alt is not None:
+            self._arc_ang = float(np.clip(alt / 45.0, -1.0, 1.0)) * ESCAPE_ARC_ANG
+            self._escape_phase = "arc"
+            self._escape_until = obs.now + ESCAPE_ARC_S
+            self._say(f"[obstacle] arcing forward toward {alt:+.0f} deg ({fs.clear_at(alt):.1f} m clear), "
+                      f"ang {self._arc_ang:+.2f}")
+            return Cmd(ESCAPE_ARC_LIN, self._arc_ang, 0.6, "ESCAPE", f"arc {alt:+.0f}")
         alt = self.free.steer(fs, want, NEED_M)
         if alt is not None and not (lo <= alt <= hi):
             alt = None
@@ -788,7 +1063,10 @@ class Navigator:
         if obs.frame is None:
             return Cmd(0.0, 0.0, 0.3, "SEARCH", "no frame")
         cap = self.route.turns[self.turn_k].start if self.turn_k < len(self.route.turns) else len(self.route) - 1
-        e = self._heading(features(obs.frame), min(self.route.node_at_p(est.p + LOOKAHEAD_M), cap))
+        ref = min(self.route.node_at_p(est.p + LOOKAHEAD_M), cap)
+        e = self._heading(features(obs.frame), ref)
+        if e is not None and GYRO_HEAD:
+            self._gyro_fix(obs, ref, e, self.log.head_src.startswith("sift"))
         if e is not None:
             self._say(f"[nav] heading found again ({self.log.head_src}, err {e:+.0f})")
             self.mode = "DRIVE"
@@ -819,6 +1097,11 @@ class Navigator:
         self._say(f"[turn {self.turn_k + 1}] done ({why}); commanded ~{self._turn_est:+.0f} deg, "
                   f"spin rate {self.spin_rate:.0f} deg/s")
         self.loc.anchor(float(self.route.p[t.end]) + 0.2, sigma_m=1.5)
+        self._band = (float(self.route.p[t.end]), obs.s_total)
+        # the teach yaw across a corner is unreliable (old gyro): let the first
+        # SIFT fixes after the corner re-anchor the gyro offset without gating
+        self._yoff_n = 0
+        self._yoff_out = []
         self.turn_k += 1
         self.mode = "DRIVE"
         self._move_ref = None
@@ -845,6 +1128,10 @@ class Navigator:
             if h is not None and abs(h) < 45.0:
                 e, ref = h, n
                 break
+        if e is not None and not self.log.head_src.startswith("sift"):
+            implied = turned - e             # total turn this lock says the corner is
+            if abs(implied - self._turn_nominal) > TURN_WEAK_LOCK_AGREE_DEG:
+                e, ref = None, -1            # weak lock disagrees with gyro + corner angle
         locked = e is not None
         self._turn_pulses += 1
         if locked:

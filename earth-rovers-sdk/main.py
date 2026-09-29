@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Literal
 
-from browser_service import BrowserService
+from browser_service import BrowserBusy, BrowserService
 from rtm_client import RtmClient
 from tts_service import generate_speech
 
@@ -216,6 +216,11 @@ async def need_start_mission():
     raise HTTPException(
         status_code=400, detail="Call /start-mission endpoint to start a mission"
     )
+
+
+@app.exception_handler(BrowserBusy)
+async def _browser_busy(request: Request, exc: BrowserBusy):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.post("/checkpoints-list")
@@ -487,6 +492,7 @@ RTM_REINIT_COOLDOWN_S = float(os.getenv("RTM_REINIT_COOLDOWN_S", "15"))
 _rtm_last_reinit = 0.0
 _rtm_reinits = 0
 _rtm_last_kick = 0.0
+_rtm_last_conflict_log = 0.0
 
 
 async def _rtm_recover(reason: str) -> None:
@@ -521,10 +527,29 @@ async def get_data():
     except Exception:
         ts, status = 0.0, {}
     age = time.time() - ts if ts else None
+    now_s = time.time()
+    kicks_60 = sum(1 for t in (status.get("kick_times") or []) if now_s - t < 60)
+    conflict = kicks_60 >= 2
+    # rovers other than ours that messaged this login in the last 30 s
+    foreign = sorted(str(k) for k, v in (status.get("peers") or {}).items()
+                     if str(k) != str(status.get("bot")) and now_s - v < 30)
     if isinstance(data, dict):
         data["rtm_state"] = status.get("state")
         data["rtm_reason"] = status.get("reason")
         data["rtm_age_s"] = round(age, 2) if age is not None else None
+        data["rtm_kicks"] = status.get("kicks", 0)
+        data["rtm_kicks_60s"] = kicks_60
+        data["rtm_conflict"] = conflict
+        data["rtm_foreign_bots"] = foreign
+    if conflict:
+        global _rtm_last_conflict_log
+        if time.time() - _rtm_last_conflict_log > 20:
+            _rtm_last_conflict_log = time.time()
+            logger.error(
+                "ANOTHER CLIENT IS LOGGED IN WITH THIS SDK KEY: kicked %d times in 60 s%s. "
+                "One key = one RTM user id, so two SDKs (even for different rovers) kick each "
+                "other every few seconds and neither can drive. Stop the other SDK/browser.",
+                kicks_60, f"; other rovers reporting to this login: {', '.join(foreign)}" if foreign else "")
     if status.get("dead"):
         # the page re-logs in by itself (static/basicRtm.js); just record it
         global _rtm_last_kick
@@ -532,7 +557,9 @@ async def get_data():
             _rtm_last_kick = time.time()
             logger.warning("RTM session dropped: state=%s reason=%s (page is re-logging in)",
                            status.get("state"), status.get("reason"))
-    if age is not None and age > RTM_STALE_S:
+    # A kicked session is not a dead page: it logs itself back in. Rebuilding
+    # the browser then only adds 10-40 s without video (2026-09-29).
+    if age is not None and age > RTM_STALE_S and not conflict:
         await _rtm_recover(f"state={status.get('state')} reason={status.get('reason')} age={age:.1f}")
     # Headless RTM often returns null after restart while the dashboard tab
     # still shows "Message from Peer". Rejoin once and retry.

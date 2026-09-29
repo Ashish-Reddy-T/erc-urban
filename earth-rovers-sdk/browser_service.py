@@ -18,6 +18,13 @@ if QUALITY < 0 or QUALITY > 1:
     raise ValueError("Invalid image quality. Quality should be between 0 and 1")
 
 
+from pyppeteer.errors import ElementHandleError
+
+
+class BrowserBusy(RuntimeError):
+    """The headless browser is being (re)started; retry shortly."""
+
+
 class BrowserService:
     def __init__(self):
         self.browser = None
@@ -32,6 +39,12 @@ class BrowserService:
     async def initialize_browser(self):
         if self.browser:
             return
+        if self._init_lock.locked():
+            # Another request is already starting Chrome (~10-40 s). Do not
+            # queue behind it: clients time out and retry at 10 Hz, and each
+            # abandoned request kept its socket (221 in CLOSE_WAIT on
+            # 2026-09-26 -> "Too many open files" at the 256 fd limit).
+            raise BrowserBusy("headless browser is starting")
         async with self._init_lock:
             if self.browser:
                 return
@@ -151,28 +164,40 @@ class BrowserService:
         await self.initialize_browser()
         return await self.page.evaluate(
             """() => ({state: window.rtm_state || null, reason: window.rtm_reason || null,
-                      dead: !!window.rtm_dead})"""
+                      dead: !!window.rtm_dead, kicks: window.rtm_kicks || 0,
+                      kick_times: window.rtm_kick_times || [],
+                      peers: window.rtm_peers || {}, bot: $("#bot_uid").val()})"""
         )
 
     async def front(self) -> str:
         await self.initialize_browser()
 
-        front_frame = await self.page.evaluate(
-            """() => {
-        return getLastBase64Frame(1000) || null;
-        }"""
-        )
+        try:
+            front_frame = await self.page.evaluate(
+                """() => {
+            return getLastBase64Frame(1000) || null;
+            }"""
+            )
+        except ElementHandleError:
+            # video not rendered yet (right after launch / a rejoin): the page
+            # throws "source width is 0" -> answer 404, not a 500 + traceback
+            return None
 
         return front_frame
 
     async def rear(self) -> str:
         await self.initialize_browser()
 
-        rear_frame = await self.page.evaluate(
-            """() => {
-        return getLastBase64Frame(1001) || null;
-        }"""
-        )
+        try:
+            rear_frame = await self.page.evaluate(
+                """() => {
+            return getLastBase64Frame(1001) || null;
+            }"""
+            )
+        except ElementHandleError:
+            # video not rendered yet (right after launch / a rejoin): the page
+            # throws "source width is 0" -> answer 404, not a 500 + traceback
+            return None
 
         return rear_frame
 
