@@ -26,8 +26,9 @@ __pycache__/
 .venv/
 venv/
 
-# The team shares one FrodoBots key, so earth-rovers-sdk/.env is tracked on
-# purpose. Keep the repo private. Vertex AI keys stay out.
+# The repo is public: keep the FrodoBots key out. Each person copies
+# earth-rovers-sdk/.env.sample to .env locally. Vertex AI keys stay out too.
+earth-rovers-sdk/.env
 *-service-account.json
 *.bak.*
 
@@ -38,3 +39,7 @@ venv/
 .claude/
 
 plan.md
+
+# LinkedIn video media kit (large, local only)
+linkedin_video/
+linkedin_video_tools/.tile_cache/
